@@ -1,13 +1,17 @@
 mod error;
+mod known_hosts;
 mod models;
 mod session;
+mod ssh_client;
 
 use chrono::Utc;
 use error::AppError;
 use models::{
-    HealthResponse, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
+    ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, HealthResponse,
+    HostKeyApproval, HostKeyInspection, SessionOutputPayload, SessionState, SessionStatus,
+    SessionStatusPayload,
 };
-use session::SessionRegistry;
+use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
@@ -15,6 +19,7 @@ use uuid::Uuid;
 const IPC_PROTOCOL_VERSION: u16 = 1;
 const SESSION_OUTPUT_EVENT: &str = "session-output";
 const SESSION_STATUS_EVENT: &str = "session-status";
+const CONNECTION_PROGRESS_EVENT: &str = "connection-progress";
 
 #[tauri::command]
 fn health_check() -> HealthResponse {
@@ -33,7 +38,7 @@ fn create_mock_session(
     let session_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
     let (cancellation, cancellation_receiver) = oneshot::channel();
-    registry.insert(session_id.clone(), cancellation)?;
+    registry.insert_mock(session_id.clone(), cancellation)?;
 
     let task_session_id = session_id.clone();
     let task_app = app.clone();
@@ -93,7 +98,26 @@ fn write_mock_session(
 }
 
 #[tauri::command]
+fn write_session(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    data: Vec<u8>,
+) -> Result<(), AppError> {
+    registry.send(&session_id, SessionCommand::Data(data))
+}
+
+#[tauri::command]
 fn resize_mock_session(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    columns: u16,
+    rows: u16,
+) -> Result<(), AppError> {
+    registry.resize(&session_id, columns, rows)
+}
+
+#[tauri::command]
+fn resize_session(
     registry: State<'_, SessionRegistry>,
     session_id: String,
     columns: u16,
@@ -118,6 +142,154 @@ fn close_mock_session(
         .map_err(|error| AppError::event_delivery_failed(SESSION_STATUS_EVENT, error))
 }
 
+#[tauri::command]
+fn close_session(registry: State<'_, SessionRegistry>, session_id: String) -> Result<(), AppError> {
+    registry.close(&session_id)
+}
+
+#[tauri::command]
+async fn inspect_ssh_host_key(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    host: String,
+    port: u16,
+    timeout_seconds: u64,
+) -> Result<HostKeyInspection, AppError> {
+    let host = host.trim().to_owned();
+    if host.is_empty() {
+        return Err(AppError::validation("请输入主机地址"));
+    }
+    if !(5..=60).contains(&timeout_seconds) {
+        return Err(AppError::validation("连接超时必须为 5～60 秒"));
+    }
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::HostKeyCheck,
+        "正在获取服务器指纹",
+    );
+    let cancellation = operations.register(operation_id.clone())?;
+    let known_hosts_path = known_hosts_path(&app)?;
+    let result = tokio::select! {
+        result = ssh_client::inspect_host_key(
+            &host,
+            port,
+            time::Duration::from_secs(timeout_seconds),
+            known_hosts_path,
+        ) => result,
+        _ = cancellation => Err(AppError::cancelled()),
+    };
+    operations.finish(&operation_id)?;
+    result
+}
+
+#[tauri::command]
+async fn test_ssh_connection(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+) -> Result<ConnectionTestResult, AppError> {
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::Connecting,
+        "正在建立 SSH 连接",
+    );
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::Authenticating,
+        "正在验证认证信息",
+    );
+    let cancellation = operations.register(operation_id.clone())?;
+    let known_hosts_path = known_hosts_path(&app)?;
+    let result = tokio::select! {
+        result = ssh_client::test_connection(request, approval, known_hosts_path) => result,
+        _ = cancellation => Err(AppError::cancelled()),
+    };
+    operations.finish(&operation_id)?;
+    if result.is_err() {
+        emit_progress(&app, &operation_id, SessionStatus::Failed, "连接测试失败");
+    }
+    result
+}
+
+#[tauri::command]
+async fn connect_ssh(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+) -> Result<SessionState, AppError> {
+    let setup_timeout = time::Duration::from_secs(request.timeout_seconds);
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::Connecting,
+        "正在建立 SSH 连接",
+    );
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::Authenticating,
+        "正在认证并创建远程 Shell",
+    );
+    let cancellation = operations.register(operation_id.clone())?;
+    let known_hosts_path = known_hosts_path(&app)?;
+    let result = tokio::select! {
+        result = time::timeout(
+            setup_timeout,
+            ssh_client::start_session(app.clone(), request, approval, known_hosts_path),
+        ) => result.map_err(|_| AppError::ssh(
+            "CONNECTION-TIMEOUT",
+            "连接超时，请检查主机、端口和防火墙",
+            "SSH session setup exceeded the configured timeout",
+            true,
+        ))?,
+        _ = cancellation => Err(AppError::cancelled()),
+    };
+    operations.finish(&operation_id)?;
+    if result.is_err() {
+        emit_progress(
+            &app,
+            &operation_id,
+            SessionStatus::Failed,
+            "SSH 会话建立失败",
+        );
+    }
+    result
+}
+
+#[tauri::command]
+fn cancel_operation(
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+) -> Result<(), AppError> {
+    operations.cancel(&operation_id)
+}
+
+fn known_hosts_path(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("known_hosts.json"))
+        .map_err(|error| AppError::storage("无法确定服务器指纹存储位置", error.to_string()))
+}
+
+fn emit_progress(app: &AppHandle, operation_id: &str, status: SessionStatus, message: &str) {
+    let _ = app.emit(
+        CONNECTION_PROGRESS_EVENT,
+        ConnectionProgressPayload {
+            operation_id: operation_id.to_owned(),
+            status,
+            message: message.to_owned(),
+        },
+    );
+}
+
 fn emit_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Result<(), AppError> {
     app.emit(
         SESSION_OUTPUT_EVENT,
@@ -133,6 +305,8 @@ fn emit_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Result<(), A
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(SessionRegistry::default())
+        .manage(OperationRegistry::default())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -149,6 +323,13 @@ pub fn run() {
             write_mock_session,
             resize_mock_session,
             close_mock_session,
+            write_session,
+            resize_session,
+            close_session,
+            inspect_ssh_host_key,
+            test_ssh_connection,
+            connect_ssh,
+            cancel_operation,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build TerminalT application");
@@ -156,6 +337,9 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
             if let Err(error) = app_handle.state::<SessionRegistry>().close_all() {
+                log::error!("{}: {}", error.code, error.message);
+            }
+            if let Err(error) = app_handle.state::<OperationRegistry>().cancel_all() {
                 log::error!("{}: {}", error.code, error.message);
             }
         }

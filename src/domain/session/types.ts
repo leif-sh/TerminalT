@@ -1,5 +1,7 @@
 export type SessionStatus =
   | 'connecting'
+  | 'host-key-check'
+  | 'authenticating'
   | 'connected'
   | 'disconnected'
   | 'failed'

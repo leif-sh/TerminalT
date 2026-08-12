@@ -6,6 +6,13 @@ import type {
   SessionStatusPayload,
   TerminalSize,
 } from '../domain/session/types'
+import type {
+  ConnectionProgressPayload,
+  ConnectionRequest,
+  ConnectionTestResult,
+  HostKeyApproval,
+  HostKeyInspection,
+} from '../domain/connection/types'
 
 export interface HealthResponse {
   status: 'ok'
@@ -23,9 +30,11 @@ export interface AppCommandError {
 
 type OutputHandler = (payload: SessionOutputPayload) => void
 type StatusHandler = (payload: SessionStatusPayload) => void
+type ProgressHandler = (payload: ConnectionProgressPayload) => void
 
 const browserOutputHandlers = new Set<OutputHandler>()
 const browserStatusHandlers = new Set<StatusHandler>()
+const browserProgressHandlers = new Set<ProgressHandler>()
 
 function isTauriRuntime(): boolean {
   return '__TAURI_INTERNALS__' in window
@@ -44,11 +53,11 @@ export async function healthCheck(): Promise<HealthResponse> {
   return invoke<HealthResponse>('health_check')
 }
 
-export async function createMockSession(): Promise<SessionState> {
+export async function createMockSession(title = '架构验证会话'): Promise<SessionState> {
   if (!isTauriRuntime()) {
     const session: SessionState = {
       id: crypto.randomUUID(),
-      title: '架构验证会话',
+      title,
       status: 'connected',
       startedAt: new Date().toISOString(),
     }
@@ -99,6 +108,72 @@ export async function closeMockSession(sessionId: string): Promise<void> {
   await invoke('close_mock_session', { sessionId })
 }
 
+export async function inspectSshHostKey(
+  operationId: string,
+  request: Pick<ConnectionRequest, 'host' | 'port' | 'timeoutSeconds'>,
+): Promise<HostKeyInspection> {
+  if (!isTauriRuntime()) {
+    browserProgressHandlers.forEach((handler) => handler({
+      operationId,
+      status: 'host-key-check',
+      message: '正在获取服务器指纹',
+    }))
+    await new Promise((resolve) => window.setTimeout(resolve, 120))
+    return {
+      host: request.host,
+      port: request.port,
+      algorithm: 'ssh-ed25519',
+      fingerprintSha256: 'SHA256:BrowserPreviewFingerprint',
+      status: 'unknown',
+    }
+  }
+  return invoke<HostKeyInspection>('inspect_ssh_host_key', {
+    operationId,
+    host: request.host,
+    port: request.port,
+    timeoutSeconds: request.timeoutSeconds,
+  })
+}
+
+export async function testSshConnection(
+  operationId: string,
+  request: ConnectionRequest,
+  approval: HostKeyApproval,
+): Promise<ConnectionTestResult> {
+  if (!isTauriRuntime()) {
+    await new Promise((resolve) => window.setTimeout(resolve, 160))
+    return {
+      elapsedMillis: 186,
+      hostKey: {
+        host: request.host,
+        port: request.port,
+        algorithm: 'ssh-ed25519',
+        fingerprintSha256: approval.fingerprintSha256,
+        status: 'trusted',
+      },
+    }
+  }
+  return invoke<ConnectionTestResult>('test_ssh_connection', {
+    operationId,
+    request,
+    approval,
+  })
+}
+
+export async function connectSsh(
+  operationId: string,
+  request: ConnectionRequest,
+  approval: HostKeyApproval,
+): Promise<SessionState> {
+  if (!isTauriRuntime()) return createMockSession(request.name)
+  return invoke<SessionState>('connect_ssh', { operationId, request, approval })
+}
+
+export async function cancelOperation(operationId: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('cancel_operation', { operationId })
+}
+
 export async function listenToSessionOutput(handler: OutputHandler): Promise<UnlistenFn> {
   if (!isTauriRuntime()) {
     browserOutputHandlers.add(handler)
@@ -113,6 +188,30 @@ export async function listenToSessionStatus(handler: StatusHandler): Promise<Unl
     return () => browserStatusHandlers.delete(handler)
   }
   return listen<SessionStatusPayload>('session-status', (event) => handler(event.payload))
+}
+
+export async function listenToConnectionProgress(handler: ProgressHandler): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) {
+    browserProgressHandlers.add(handler)
+    return () => browserProgressHandlers.delete(handler)
+  }
+  return listen<ConnectionProgressPayload>('connection-progress', (event) => handler(event.payload))
+}
+
+export async function writeSession(sessionId: string, input: string): Promise<void> {
+  const data = Array.from(new TextEncoder().encode(input))
+  if (!isTauriRuntime()) return writeMockSession(sessionId, input)
+  await invoke('write_session', { sessionId, data })
+}
+
+export async function resizeSession(sessionId: string, size: TerminalSize): Promise<void> {
+  if (!isTauriRuntime()) return resizeMockSession(sessionId, size)
+  await invoke('resize_session', { sessionId, ...size })
+}
+
+export async function closeSession(sessionId: string): Promise<void> {
+  if (!isTauriRuntime()) return closeMockSession(sessionId)
+  await invoke('close_session', { sessionId })
 }
 
 export function normalizeCommandError(error: unknown): AppCommandError {

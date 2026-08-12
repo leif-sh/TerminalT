@@ -40,4 +40,77 @@ impl AppError {
             retryable: true,
         }
     }
+
+    pub fn invalid_session_operation() -> Self {
+        Self::new(
+            "SESSION-INVALID-OPERATION",
+            "session",
+            "当前会话不支持该操作",
+            None,
+            false,
+        )
+    }
+
+    pub fn session_command_failed(details: String) -> Self {
+        Self::new(
+            "SESSION-COMMAND-FAILED",
+            "session",
+            "无法向远端会话发送数据",
+            Some(details),
+            true,
+        )
+    }
+
+    pub fn operation_registry_unavailable() -> Self {
+        Self::new(
+            "OPERATION-REGISTRY-UNAVAILABLE",
+            "internal",
+            "连接任务服务暂时不可用",
+            None,
+            true,
+        )
+    }
+
+    pub fn cancelled() -> Self {
+        Self::new("OPERATION-CANCELLED", "cancelled", "操作已取消", None, true)
+    }
+
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self::new("CONNECTION-INVALID", "validation", message, None, false)
+    }
+
+    pub fn ssh(
+        code: &'static str,
+        message: impl Into<String>,
+        details: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self::new(code, "ssh", message, Some(details.into()), retryable)
+    }
+
+    pub fn storage(message: impl Into<String>, details: impl Into<String>) -> Self {
+        Self::new(
+            "HOST-KEY-STORAGE-FAILED",
+            "storage",
+            message,
+            Some(details.into()),
+            true,
+        )
+    }
+
+    fn new(
+        code: &'static str,
+        category: &'static str,
+        message: impl Into<String>,
+        technical_details: Option<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            code,
+            category,
+            message: message.into(),
+            technical_details,
+            retryable,
+        }
+    }
 }

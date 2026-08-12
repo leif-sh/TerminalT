@@ -1,0 +1,794 @@
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use russh::{
+    client::{self},
+    keys::{load_secret_key, ssh_key, PrivateKeyWithHashAlg},
+    ChannelMsg, Disconnect,
+};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
+use zeroize::Zeroizing;
+
+use crate::{
+    error::AppError,
+    known_hosts::{HostKeyIdentity, KnownHostsStore},
+    models::{
+        AuthType, ConnectionRequest, ConnectionTestResult, HostKeyApproval, HostKeyInspection,
+        SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
+    },
+    session::{SessionCommand, SessionRegistry},
+};
+
+const SESSION_OUTPUT_EVENT: &str = "session-output";
+const SESSION_STATUS_EVENT: &str = "session-status";
+
+#[derive(Clone)]
+struct ProbeHandler {
+    captured_key: Arc<Mutex<Option<ssh_key::PublicKey>>>,
+}
+
+impl client::Handler for ProbeHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        if let Ok(mut captured_key) = self.captured_key.lock() {
+            *captured_key = Some(server_public_key.clone());
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Clone)]
+struct VerifiedHandler {
+    expected_fingerprint: String,
+    captured_key: Arc<Mutex<Option<ssh_key::PublicKey>>>,
+}
+
+impl client::Handler for VerifiedHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let fingerprint = server_public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        if let Ok(mut captured_key) = self.captured_key.lock() {
+            *captured_key = Some(server_public_key.clone());
+        }
+        Ok(fingerprint == self.expected_fingerprint)
+    }
+}
+
+pub async fn inspect_host_key(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    known_hosts_path: PathBuf,
+) -> Result<HostKeyInspection, AppError> {
+    let captured_key = Arc::new(Mutex::new(None));
+    let handler = ProbeHandler {
+        captured_key: Arc::clone(&captured_key),
+    };
+    let config = Arc::new(client_config());
+    let connection = tokio::time::timeout(
+        timeout,
+        client::connect(config, (host.to_owned(), port), handler),
+    )
+    .await
+    .map_err(|_| connection_timeout())?
+    .map_err(map_connect_error)?;
+    let _ = connection
+        .disconnect(Disconnect::ByApplication, "host key inspected", "")
+        .await;
+
+    let key = captured_key
+        .lock()
+        .map_err(|_| {
+            AppError::ssh(
+                "HOST-KEY-READ-FAILED",
+                "无法读取服务器指纹",
+                "host key capture lock was poisoned",
+                true,
+            )
+        })?
+        .clone()
+        .ok_or_else(|| {
+            AppError::ssh(
+                "HOST-KEY-MISSING",
+                "服务器未提供可验证的主机密钥",
+                "SSH handshake completed without a captured server key",
+                false,
+            )
+        })?;
+    let identity = HostKeyIdentity::from_public_key(&key).map_err(map_russh_error)?;
+    KnownHostsStore::new(known_hosts_path).inspect(host, port, &identity)
+}
+
+pub async fn test_connection(
+    mut request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+) -> Result<ConnectionTestResult, AppError> {
+    request.validate().map_err(AppError::validation)?;
+    let started_at = Instant::now();
+    let host = request.host.clone();
+    let port = request.port;
+    let timeout = Duration::from_secs(request.timeout_seconds);
+    let (handle, identity) = tokio::time::timeout(
+        timeout,
+        connect_authenticated(&mut request, &approval.fingerprint_sha256),
+    )
+    .await
+    .map_err(|_| connection_timeout())??;
+
+    KnownHostsStore::new(known_hosts_path.clone()).approve(
+        &host,
+        port,
+        &identity,
+        approval.action,
+    )?;
+    let inspection = KnownHostsStore::new(known_hosts_path).inspect(&host, port, &identity)?;
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "connection test complete", "")
+        .await;
+
+    Ok(ConnectionTestResult {
+        elapsed_millis: started_at.elapsed().as_millis(),
+        host_key: inspection,
+    })
+}
+
+pub async fn start_session(
+    app: AppHandle,
+    mut request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+) -> Result<SessionState, AppError> {
+    request.validate().map_err(AppError::validation)?;
+    let timeout = Duration::from_secs(request.timeout_seconds);
+    let title = request.name.clone();
+    let host = request.host.clone();
+    let port = request.port;
+    let columns = request.columns;
+    let rows = request.rows;
+    let (handle, identity) = tokio::time::timeout(
+        timeout,
+        connect_authenticated(&mut request, &approval.fingerprint_sha256),
+    )
+    .await
+    .map_err(|_| connection_timeout())??;
+
+    KnownHostsStore::new(known_hosts_path).approve(&host, port, &identity, approval.action)?;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(map_russh_error)?;
+    channel
+        .request_pty(
+            true,
+            "xterm-256color",
+            u32::from(columns),
+            u32::from(rows),
+            0,
+            0,
+            &[],
+        )
+        .await
+        .map_err(map_russh_error)?;
+    channel.request_shell(true).await.map_err(map_russh_error)?;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (commands_tx, commands_rx) = mpsc::channel(128);
+    app.state::<SessionRegistry>()
+        .insert_ssh(session_id.clone(), commands_tx)?;
+
+    let task_app = app.clone();
+    let task_session_id = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        run_session(task_app, task_session_id, handle, channel, commands_rx).await;
+    });
+
+    Ok(SessionState {
+        id: session_id,
+        title,
+        status: SessionStatus::Connected,
+        started_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+async fn connect_authenticated(
+    request: &mut ConnectionRequest,
+    expected_fingerprint: &str,
+) -> Result<(client::Handle<VerifiedHandler>, HostKeyIdentity), AppError> {
+    let captured_key = Arc::new(Mutex::new(None));
+    let handler = VerifiedHandler {
+        expected_fingerprint: expected_fingerprint.to_owned(),
+        captured_key: Arc::clone(&captured_key),
+    };
+    let config = Arc::new(client_config());
+    let mut handle = client::connect(config, (request.host.clone(), request.port), handler)
+        .await
+        .map_err(|error| {
+            let actual = captured_key
+                .lock()
+                .ok()
+                .and_then(|key| key.clone())
+                .map(|key| key.fingerprint(russh::keys::HashAlg::Sha256).to_string());
+            if actual
+                .as_deref()
+                .is_some_and(|value| value != expected_fingerprint)
+            {
+                AppError::ssh(
+                    "HOST-KEY-CHANGED",
+                    "服务器身份与确认时不一致，连接已阻止",
+                    "server host key changed between inspection and connection",
+                    false,
+                )
+            } else {
+                map_connect_error(error)
+            }
+        })?;
+
+    let key = captured_key
+        .lock()
+        .map_err(|_| {
+            AppError::ssh(
+                "HOST-KEY-READ-FAILED",
+                "无法读取服务器指纹",
+                "host key capture lock was poisoned",
+                true,
+            )
+        })?
+        .clone()
+        .ok_or_else(|| {
+            AppError::ssh(
+                "HOST-KEY-MISSING",
+                "服务器未提供可验证的主机密钥",
+                "SSH handshake completed without a captured server key",
+                false,
+            )
+        })?;
+    let identity = HostKeyIdentity::from_public_key(&key).map_err(map_russh_error)?;
+
+    let authentication = match request.auth_type {
+        AuthType::Password => {
+            let password = Zeroizing::new(request.password.take().unwrap_or_default());
+            handle
+                .authenticate_password(request.username.clone(), password.as_str())
+                .await
+                .map_err(map_russh_error)?
+        }
+        AuthType::PrivateKey => {
+            let path = request.private_key_path.take().unwrap_or_default();
+            let passphrase = request.private_key_passphrase.take().map(Zeroizing::new);
+            let key = tokio::task::spawn_blocking(move || {
+                load_secret_key(path, passphrase.as_ref().map(|value| value.as_str()))
+            })
+            .await
+            .map_err(|error| {
+                AppError::ssh(
+                    "PRIVATE-KEY-READ-FAILED",
+                    "无法读取所选私钥",
+                    error.to_string(),
+                    true,
+                )
+            })?
+            .map_err(map_private_key_error)?;
+            let hash_algorithm = handle
+                .best_supported_rsa_hash()
+                .await
+                .map_err(map_russh_error)?
+                .flatten();
+            handle
+                .authenticate_publickey(
+                    request.username.clone(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_algorithm),
+                )
+                .await
+                .map_err(map_russh_error)?
+        }
+    };
+
+    if !authentication.success() {
+        let remaining = format!("authentication rejected: {authentication:?}");
+        return Err(AppError::ssh(
+            "AUTHENTICATION-FAILED",
+            "认证失败，请检查用户名和凭据",
+            remaining,
+            true,
+        ));
+    }
+
+    Ok((handle, identity))
+}
+
+async fn run_session(
+    app: AppHandle,
+    session_id: String,
+    handle: client::Handle<VerifiedHandler>,
+    channel: russh::Channel<client::Msg>,
+    mut commands: mpsc::Receiver<SessionCommand>,
+) {
+    let (mut reader, writer) = channel.split();
+    let mut final_message = "远端会话已关闭".to_owned();
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(SessionCommand::Data(data)) => {
+                    if let Err(error) = writer.data_bytes(data).await {
+                        final_message = format!("网络写入失败：{error}");
+                        break;
+                    }
+                }
+                Some(SessionCommand::Resize { columns, rows }) => {
+                    if let Err(error) = writer.window_change(u32::from(columns), u32::from(rows), 0, 0).await {
+                        log::warn!("PTY resize failed for session {session_id}: {error}");
+                    }
+                }
+                Some(SessionCommand::Close) | None => {
+                    final_message = "会话已关闭".to_owned();
+                    let _ = writer.close().await;
+                    break;
+                }
+            },
+            message = reader.wait() => match message {
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    if let Err(error) = app.emit(SESSION_OUTPUT_EVENT, SessionOutputPayload {
+                        session_id: session_id.clone(),
+                        data: data.to_vec(),
+                    }) {
+                        final_message = format!("终端数据发送失败：{error}");
+                        break;
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    final_message = format!("远端 Shell 已退出，状态码 {exit_status}");
+                    break;
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                _ => {}
+            }
+        }
+    }
+
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "session closed", "")
+        .await;
+    let _ = app.state::<SessionRegistry>().remove_finished(&session_id);
+    let _ = app.emit(
+        SESSION_STATUS_EVENT,
+        SessionStatusPayload {
+            session_id,
+            status: SessionStatus::Disconnected,
+            message: Some(final_message),
+        },
+    );
+}
+
+fn client_config() -> client::Config {
+    client::Config {
+        nodelay: true,
+        ..Default::default()
+    }
+}
+
+fn connection_timeout() -> AppError {
+    AppError::ssh(
+        "CONNECTION-TIMEOUT",
+        "连接超时，请检查主机、端口和防火墙",
+        "SSH setup exceeded the configured timeout",
+        true,
+    )
+}
+
+fn map_connect_error(error: russh::Error) -> AppError {
+    if let russh::Error::IO(io_error) = &error {
+        return match io_error.kind() {
+            std::io::ErrorKind::NotFound => AppError::ssh(
+                "DNS-RESOLUTION-FAILED",
+                "无法解析主机名，请检查地址或网络设置",
+                io_error.to_string(),
+                true,
+            ),
+            std::io::ErrorKind::ConnectionRefused => AppError::ssh(
+                "CONNECTION-REFUSED",
+                "目标主机拒绝连接，请确认 SSH 服务和端口",
+                io_error.to_string(),
+                true,
+            ),
+            std::io::ErrorKind::TimedOut => connection_timeout(),
+            _ => AppError::ssh(
+                "NETWORK-ERROR",
+                "无法连接服务器，请检查网络设置",
+                io_error.to_string(),
+                true,
+            ),
+        };
+    }
+    map_russh_error(error)
+}
+
+fn map_russh_error(error: russh::Error) -> AppError {
+    let details = error.to_string();
+    match error {
+        russh::Error::NoCommonAlgo { .. } => AppError::ssh(
+            "SSH-NO-COMMON-ALGORITHM",
+            "无法与服务器协商安全算法",
+            details,
+            false,
+        ),
+        russh::Error::UnknownKey | russh::Error::KeyChanged { .. } => AppError::ssh(
+            "HOST-KEY-REJECTED",
+            "服务器身份校验失败，连接已阻止",
+            details,
+            false,
+        ),
+        russh::Error::ConnectionTimeout | russh::Error::InactivityTimeout => connection_timeout(),
+        russh::Error::HUP | russh::Error::Disconnect => {
+            AppError::ssh("REMOTE-CLOSED", "服务器已关闭当前连接", details, true)
+        }
+        _ => AppError::ssh(
+            "SSH-PROTOCOL-ERROR",
+            "SSH 握手或会话建立失败",
+            details,
+            true,
+        ),
+    }
+}
+
+fn map_private_key_error(error: russh::keys::Error) -> AppError {
+    let details = error.to_string();
+    match error {
+        russh::keys::Error::IO(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
+            AppError::ssh(
+                "PRIVATE-KEY-NOT-FOUND",
+                "所选私钥文件不存在",
+                io_error.to_string(),
+                false,
+            )
+        }
+        russh::keys::Error::IO(io_error)
+            if io_error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            AppError::ssh(
+                "PRIVATE-KEY-PERMISSION-DENIED",
+                "没有权限读取所选私钥",
+                io_error.to_string(),
+                false,
+            )
+        }
+        russh::keys::Error::KeyIsEncrypted => AppError::ssh(
+            "PRIVATE-KEY-PASSPHRASE-REQUIRED",
+            "该私钥需要口令",
+            details,
+            true,
+        ),
+        _ if details.to_ascii_lowercase().contains("decrypt")
+            || details.to_ascii_lowercase().contains("password") =>
+        {
+            AppError::ssh(
+                "PRIVATE-KEY-PASSPHRASE-INVALID",
+                "私钥口令不正确",
+                details,
+                true,
+            )
+        }
+        _ => AppError::ssh(
+            "PRIVATE-KEY-INVALID",
+            "无法读取或解析所选私钥",
+            details,
+            false,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use russh::{
+        keys::{ssh_key, Algorithm, EcdsaCurve, HashAlg, PrivateKey},
+        server::{self, Auth, Msg, Server as _, Session},
+        Channel, ChannelId,
+    };
+    use tokio::sync::Mutex;
+
+    use super::{connect_authenticated, inspect_host_key};
+    use crate::{
+        known_hosts::KnownHostsStore,
+        models::{AuthType, ConnectionRequest, HostKeyStatus},
+    };
+
+    #[derive(Clone, Default)]
+    struct TestServer {
+        channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+    }
+
+    impl server::Server for TestServer {
+        type Handler = Self;
+
+        fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
+            self.clone()
+        }
+    }
+
+    impl server::Handler for TestServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+            Ok(if user == "terminalt" && password == "test-secret" {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            })
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            _: &ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if user == "terminalt" {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<Msg>,
+            reply: server::ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.channels.lock().await.insert(channel.id(), channel);
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: &[(russh::Pty, u32)],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, b"terminal-ready\r\n".to_vec())?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.data(channel, data.to_vec())?;
+            Ok(())
+        }
+    }
+
+    async fn start_server() -> (std::net::SocketAddr, String, tokio::task::JoinHandle<()>) {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let config = Arc::new(server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let task = tokio::spawn(async move {
+            let mut server = TestServer::default();
+            let _ = server.run_on_address(config, address).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        (address, fingerprint, task)
+    }
+
+    fn request(address: std::net::SocketAddr, auth_type: AuthType) -> ConnectionRequest {
+        ConnectionRequest {
+            name: "integration".to_owned(),
+            host: address.ip().to_string(),
+            port: address.port(),
+            username: "terminalt".to_owned(),
+            auth_type,
+            password: Some("test-secret".to_owned()),
+            private_key_path: None,
+            private_key_passphrase: None,
+            columns: 100,
+            rows: 30,
+            timeout_seconds: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn password_authentication_opens_pty_shell() {
+        let (address, fingerprint, server) = start_server().await;
+        let mut connection = request(address, AuthType::Password);
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            .await
+            .unwrap();
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 100, 30, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(russh::ChannelMsg::Data { data }) = channel.wait().await {
+                    break data;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.as_ref(), b"terminal-ready\r\n");
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn private_key_authentication_succeeds() {
+        let (address, fingerprint, server) = start_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("id_ed25519");
+        let private_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        std::fs::write(
+            &key_path,
+            private_key
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut connection = request(address, AuthType::PrivateKey);
+        connection.password = None;
+        connection.private_key_path = Some(key_path.to_string_lossy().into_owned());
+
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            .await
+            .unwrap();
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn common_openssh_key_algorithms_and_passphrase_are_supported() {
+        let (address, fingerprint, server) = start_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let algorithms = [
+            Algorithm::Ed25519,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+            Algorithm::Rsa { hash: None },
+        ];
+
+        for (index, algorithm) in algorithms.into_iter().enumerate() {
+            let path = directory.path().join(format!("id_test_{index}"));
+            let key = PrivateKey::random(&mut rand::rng(), algorithm).unwrap();
+            let (key, passphrase) = if index == 0 {
+                (
+                    key.encrypt(&mut rand::rng(), "key-passphrase").unwrap(),
+                    Some("key-passphrase".to_owned()),
+                )
+            } else {
+                (key, None)
+            };
+            std::fs::write(
+                &path,
+                key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+            )
+            .unwrap();
+
+            let mut connection = request(address, AuthType::PrivateKey);
+            connection.password = None;
+            connection.private_key_path = Some(path.to_string_lossy().into_owned());
+            connection.private_key_passphrase = passphrase;
+            let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+                .await
+                .unwrap();
+            handle
+                .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+                .await
+                .unwrap();
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn incorrect_password_is_rejected_without_echoing_the_secret() {
+        let (address, fingerprint, server) = start_server().await;
+        let mut connection = request(address, AuthType::Password);
+        connection.password = Some("must-not-appear".to_owned());
+        let error = match connect_authenticated(&mut connection, &fingerprint).await {
+            Ok(_) => panic!("incorrect password unexpectedly authenticated"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "AUTHENTICATION-FAILED");
+        assert!(!error
+            .technical_details
+            .as_deref()
+            .unwrap_or_default()
+            .contains("must-not-appear"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn host_key_inspection_detects_unknown_then_trusted_key() {
+        let (address, _, server) = start_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("known_hosts.json");
+        let first = inspect_host_key(
+            &address.ip().to_string(),
+            address.port(),
+            Duration::from_secs(5),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first.status, HostKeyStatus::Unknown));
+
+        let identity = super::HostKeyIdentity {
+            algorithm: first.algorithm.clone(),
+            fingerprint_sha256: first.fingerprint_sha256.clone(),
+            public_key: "test-public-key".to_owned(),
+        };
+        KnownHostsStore::new(path.clone())
+            .approve(
+                &first.host,
+                first.port,
+                &identity,
+                crate::models::HostKeyAction::TrustNew,
+            )
+            .unwrap();
+        let second = inspect_host_key(
+            &address.ip().to_string(),
+            address.port(),
+            Duration::from_secs(5),
+            path,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second.status, HostKeyStatus::Trusted));
+        server.abort();
+    }
+}

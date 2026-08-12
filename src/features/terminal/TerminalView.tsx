@@ -5,8 +5,8 @@ import '@xterm/xterm/css/xterm.css'
 import type { SessionState } from '../../domain/session/types'
 import {
   listenToSessionOutput,
-  resizeMockSession,
-  writeMockSession,
+  resizeSession,
+  writeSession,
 } from '../../lib/ipc'
 
 interface TerminalViewProps {
@@ -59,7 +59,7 @@ export function TerminalView({ session, active }: TerminalViewProps) {
 
     const resize = () => {
       fitAddon.fit()
-      void resizeMockSession(session.id, {
+      void resizeSession(session.id, {
         columns: terminal.cols,
         rows: terminal.rows,
       })
@@ -69,7 +69,7 @@ export function TerminalView({ session, active }: TerminalViewProps) {
     resize()
 
     const inputDisposable = terminal.onData((input) => {
-      void writeMockSession(session.id, input)
+      void writeSession(session.id, input)
     })
 
     let disposed = false

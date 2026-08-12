@@ -3,6 +3,8 @@ import './App.css'
 import { Icon } from './components/Icon'
 import { TerminalView } from './features/terminal/TerminalView'
 import { useSessionController } from './features/sessions/useSessionController'
+import { ConnectionDialog } from './features/connections/ConnectionDialog'
+import type { ConnectionRequest, HostKeyApproval } from './domain/connection/types'
 import { healthCheck, normalizeCommandError, type HealthResponse } from './lib/ipc'
 import { t } from './lib/i18n'
 
@@ -12,12 +14,12 @@ function App() {
   const [view, setView] = useState<View>('connections')
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string>()
+  const [connectionDialogOpen, setConnectionDialogOpen] = useState(false)
   const {
     sessions,
     activeSessionId,
-    pending,
     error,
-    startMockSession,
+    startSession,
     closeSession,
     activateSession,
   } = useSessionController()
@@ -82,14 +84,16 @@ function App() {
       <section className="application-area">
         {view === 'connections' ? (
           <>
-            <ConnectionsPanel pending={pending} onStartMockSession={startMockSession} />
+            <ConnectionsPanel
+              hasSession={sessions.length > 0}
+              onNewConnection={() => setConnectionDialogOpen(true)}
+            />
             <SessionWorkspace
               sessions={sessions}
               activeSessionId={activeSessionId}
               activeSessionTitle={activeSession?.title}
-              pending={pending}
               error={error}
-              onStartMockSession={startMockSession}
+              onNewConnection={() => setConnectionDialogOpen(true)}
               onActivateSession={activateSession}
               onCloseSession={closeSession}
             />
@@ -98,16 +102,25 @@ function App() {
           <SettingsView />
         )}
       </section>
+      <ConnectionDialog
+        open={connectionDialogOpen}
+        onClose={() => setConnectionDialogOpen(false)}
+        onConnect={async (
+          operationId: string,
+          request: ConnectionRequest,
+          approval: HostKeyApproval,
+        ) => startSession(operationId, request, approval)}
+      />
     </main>
   )
 }
 
 interface ConnectionsPanelProps {
-  pending: boolean
-  onStartMockSession: () => Promise<void>
+  hasSession: boolean
+  onNewConnection: () => void
 }
 
-function ConnectionsPanel({ pending, onStartMockSession }: ConnectionsPanelProps) {
+function ConnectionsPanel({ hasSession, onNewConnection }: ConnectionsPanelProps) {
   return (
     <aside className="connections-panel" aria-label={t('connectionCenter')}>
       <header className="panel-header">
@@ -115,7 +128,7 @@ function ConnectionsPanel({ pending, onStartMockSession }: ConnectionsPanelProps
           <span className="eyebrow">SSH</span>
           <h1>{t('connectionCenter')}</h1>
         </div>
-        <button className="icon-button" type="button" disabled aria-label={t('newConnection')} title={t('comingLater')}>
+        <button className="icon-button" type="button" onClick={onNewConnection} disabled={hasSession} aria-label={t('newConnection')} title={hasSession ? '阶段 1 仅支持单会话' : t('newConnection')}>
           <Icon name="plus" />
         </button>
       </header>
@@ -137,14 +150,14 @@ function ConnectionsPanel({ pending, onStartMockSession }: ConnectionsPanelProps
         <p>{t('noConnectionsHint')}</p>
       </div>
 
-      <div className="prototype-card">
-        <div className="prototype-icon"><Icon name="terminal" /></div>
+      <div className="prototype-card connection-entry">
+        <div className="prototype-icon"><Icon name="connection" /></div>
         <div>
-          <strong>{t('mockSessionTitle')}</strong>
-          <span>{t('mockSessionHint')}</span>
+          <strong>临时 SSH 连接</strong>
+          <span>密码和私钥只在当前连接流程中使用，不会保存。</span>
         </div>
-        <button type="button" onClick={() => void onStartMockSession()} disabled={pending}>
-          {pending ? '启动中…' : '启动'}
+        <button type="button" onClick={onNewConnection} disabled={hasSession}>
+          {hasSession ? '已有活动会话' : '新建连接'}
         </button>
       </div>
     </aside>
@@ -155,9 +168,8 @@ interface SessionWorkspaceProps {
   sessions: ReturnType<typeof useSessionController>['sessions']
   activeSessionId?: string
   activeSessionTitle?: string
-  pending: boolean
   error?: string
-  onStartMockSession: () => Promise<void>
+  onNewConnection: () => void
   onActivateSession: (sessionId: string) => void
   onCloseSession: (sessionId: string) => Promise<void>
 }
@@ -166,9 +178,8 @@ function SessionWorkspace({
   sessions,
   activeSessionId,
   activeSessionTitle,
-  pending,
   error,
-  onStartMockSession,
+  onNewConnection,
   onActivateSession,
   onCloseSession,
 }: SessionWorkspaceProps) {
@@ -182,9 +193,9 @@ function SessionWorkspace({
             {activeSessionId ? t('terminalReady') : '等待会话'}
           </span>
         </div>
-        <button className="primary-button" type="button" onClick={() => void onStartMockSession()} disabled={pending}>
+        <button className="primary-button" type="button" onClick={onNewConnection} disabled={sessions.length > 0}>
           <Icon name="plus" />
-          {t('startMockSession')}
+          {t('newConnection')}
         </button>
       </header>
 
@@ -224,7 +235,7 @@ function SessionWorkspace({
       <div className="workspace-content">
         {error && <div className="inline-error" role="alert">{error}</div>}
         {sessions.length === 0 ? (
-          <EmptyWorkspace pending={pending} onStartMockSession={onStartMockSession} />
+          <EmptyWorkspace onNewConnection={onNewConnection} />
         ) : (
           sessions.map((session) => (
             <TerminalView
@@ -245,9 +256,8 @@ function SessionWorkspace({
 }
 
 function EmptyWorkspace({
-  pending,
-  onStartMockSession,
-}: Pick<SessionWorkspaceProps, 'pending' | 'onStartMockSession'>) {
+  onNewConnection,
+}: Pick<SessionWorkspaceProps, 'onNewConnection'>) {
   return (
     <div className="empty-workspace">
       <div className="terminal-orbit" aria-hidden="true">
@@ -258,11 +268,11 @@ function EmptyWorkspace({
       <span className="eyebrow">TERMINAL WORKSPACE</span>
       <h2>{t('workspaceTitle')}</h2>
       <p>{t('workspaceDescription')}</p>
-      <button className="primary-button large" type="button" onClick={() => void onStartMockSession()} disabled={pending}>
+      <button className="primary-button large" type="button" onClick={onNewConnection}>
         <Icon name="terminal" />
-        {pending ? '正在启动…' : t('startMockSession')}
+        {t('newConnection')}
       </button>
-      <span className="empty-footnote">{t('mockSessionHint')}</span>
+      <span className="empty-footnote">密码和私钥仅用于本次连接，不会保存。</span>
     </div>
   )
 }

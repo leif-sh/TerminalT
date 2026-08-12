@@ -1,6 +1,6 @@
 [package]
 name = "terminalt"
-version = "0.1.0-1"
+version = "0.1.0-2"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -24,5 +24,12 @@ log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
+russh = { version = "0.62.6", default-features = false, features = ["flate2", "ring", "rsa"] }
+tauri-plugin-dialog = "2"
+zeroize = "1"
+
+[dev-dependencies]
+rand = "0.10"
+tempfile = "3"

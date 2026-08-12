@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,8 +20,12 @@ pub struct SessionState {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionStatus {
+    Connecting,
+    HostKeyCheck,
+    Authenticating,
     Connected,
     Disconnected,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -37,4 +41,114 @@ pub struct SessionStatusPayload {
     pub session_id: String,
     pub status: SessionStatus,
     pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionRequest {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_type: AuthType,
+    pub password: Option<String>,
+    pub private_key_path: Option<String>,
+    pub private_key_passphrase: Option<String>,
+    pub columns: u16,
+    pub rows: u16,
+    pub timeout_seconds: u64,
+}
+
+impl ConnectionRequest {
+    pub fn validate(&mut self) -> Result<(), &'static str> {
+        self.name = self.name.trim().to_owned();
+        self.host = self.host.trim().to_owned();
+        self.username = self.username.trim().to_owned();
+        if self.name.is_empty() || self.name.chars().count() > 64 {
+            return Err("连接名称长度必须为 1～64 个字符");
+        }
+        if self.host.is_empty() {
+            return Err("请输入主机地址");
+        }
+        if self.username.is_empty() || self.username.chars().count() > 128 {
+            return Err("用户名长度必须为 1～128 个字符");
+        }
+        if !(5..=60).contains(&self.timeout_seconds) {
+            return Err("连接超时必须为 5～60 秒");
+        }
+        if self.columns == 0 || self.rows == 0 {
+            return Err("终端尺寸必须大于 0");
+        }
+        match self.auth_type {
+            AuthType::Password if self.password.as_deref().unwrap_or_default().is_empty() => {
+                Err("请输入密码")
+            }
+            AuthType::PrivateKey
+                if self
+                    .private_key_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty() =>
+            {
+                Err("请选择私钥文件")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthType {
+    Password,
+    PrivateKey,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyInspection {
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint_sha256: String,
+    pub status: HostKeyStatus,
+    pub previous_fingerprint_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostKeyStatus {
+    Trusted,
+    Unknown,
+    Changed,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyApproval {
+    pub fingerprint_sha256: String,
+    pub action: HostKeyAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HostKeyAction {
+    UseTrusted,
+    TrustNew,
+    ReplaceChanged,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionTestResult {
+    pub elapsed_millis: u128,
+    pub host_key: HostKeyInspection,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProgressPayload {
+    pub operation_id: String,
+    pub status: SessionStatus,
+    pub message: String,
 }

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useReducer } from 'react'
 import type { SessionState, SessionStatusPayload } from '../../domain/session/types'
 import {
-  closeMockSession,
-  createMockSession,
+  closeSession as closeRuntimeSession,
+  connectSsh,
   listenToSessionStatus,
   normalizeCommandError,
 } from '../../lib/ipc'
+import type { ConnectionRequest, HostKeyApproval } from '../../domain/connection/types'
 
 interface SessionControllerState {
   sessions: SessionState[]
@@ -92,18 +93,23 @@ export function useSessionController() {
     }
   }, [])
 
-  const startMockSession = useCallback(async () => {
+  const startSession = useCallback(async (
+    operationId: string,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+  ) => {
     dispatch({ type: 'create-started' })
     try {
-      const session = await createMockSession()
+      const session = await connectSsh(operationId, request, approval)
       dispatch({ type: 'created', session })
     } catch (error) {
       dispatch({ type: 'create-failed', message: normalizeCommandError(error).message })
+      throw error
     }
   }, [])
 
   const closeSession = useCallback(async (sessionId: string) => {
-    await closeMockSession(sessionId)
+    await closeRuntimeSession(sessionId)
     dispatch({ type: 'closed', sessionId })
   }, [])
 
@@ -111,5 +117,5 @@ export function useSessionController() {
     dispatch({ type: 'activated', sessionId })
   }, [])
 
-  return { ...state, startMockSession, closeSession, activateSession }
+  return { ...state, startSession, closeSession, activateSession }
 }
