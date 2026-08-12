@@ -562,9 +562,19 @@ mod tests {
         models::{AuthType, ConnectionRequest, HostKeyStatus},
     };
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct TestServer {
         channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+        startup_output: Arc<Vec<u8>>,
+    }
+
+    impl Default for TestServer {
+        fn default() -> Self {
+            Self {
+                channels: Arc::default(),
+                startup_output: Arc::new(b"terminal-ready\r\n".to_vec()),
+            }
+        }
     }
 
     impl server::Server for TestServer {
@@ -630,7 +640,9 @@ mod tests {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             session.channel_success(channel)?;
-            session.data(channel, b"terminal-ready\r\n".to_vec())?;
+            for chunk in self.startup_output.chunks(64 * 1024) {
+                session.data(channel, chunk.to_vec())?;
+            }
             Ok(())
         }
 
@@ -646,6 +658,12 @@ mod tests {
     }
 
     async fn start_server() -> (std::net::SocketAddr, String, tokio::task::JoinHandle<()>) {
+        start_server_with_output(b"terminal-ready\r\n".to_vec()).await
+    }
+
+    async fn start_server_with_output(
+        startup_output: Vec<u8>,
+    ) -> (std::net::SocketAddr, String, tokio::task::JoinHandle<()>) {
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let fingerprint = host_key
             .public_key()
@@ -661,7 +679,10 @@ mod tests {
         let address = socket.local_addr().unwrap();
         drop(socket);
         let task = tokio::spawn(async move {
-            let mut server = TestServer::default();
+            let mut server = TestServer {
+                startup_output: Arc::new(startup_output),
+                ..TestServer::default()
+            };
             let _ = server.run_on_address(config, address).await;
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -709,6 +730,164 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output.as_ref(), b"terminal-ready\r\n");
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ten_sessions_remain_isolated_when_another_authentication_fails() {
+        let (address, fingerprint, server) = start_server().await;
+        let mut handles = Vec::new();
+        for index in 0..10 {
+            let mut connection = request(address, AuthType::Password);
+            connection.name = format!("session-{index}");
+            let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+                .await
+                .unwrap();
+            handles.push(handle);
+        }
+
+        let mut rejected = request(address, AuthType::Password);
+        rejected.password = Some("incorrect".to_owned());
+        let error = match connect_authenticated(&mut rejected, &fingerprint).await {
+            Ok(_) => panic!("incorrect password unexpectedly authenticated"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "AUTHENTICATION-FAILED");
+
+        for (index, handle) in handles.into_iter().enumerate() {
+            let channel = handle.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm-256color", 100, 30, 0, 0, &[])
+                .await
+                .unwrap();
+            channel.request_shell(true).await.unwrap();
+            let (mut reader, writer) = channel.split();
+            let ready = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(russh::ChannelMsg::Data { data }) = reader.wait().await {
+                        break data;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(ready.as_ref(), b"terminal-ready\r\n");
+
+            let probe = format!("probe-{index}").into_bytes();
+            writer.data_bytes(probe.clone()).await.unwrap();
+            let echoed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(russh::ChannelMsg::Data { data }) = reader.wait().await {
+                        break data;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(echoed.as_ref(), probe);
+            drop(reader);
+            drop(writer);
+            handle
+                .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+                .await
+                .unwrap();
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn five_megabytes_of_output_preserve_follow_up_interaction() {
+        const OUTPUT_SIZE: usize = 5 * 1024 * 1024;
+        let startup_output = vec![b'L'; OUTPUT_SIZE];
+        let (address, fingerprint, server) = start_server_with_output(startup_output).await;
+        let mut connection = request(address, AuthType::Password);
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            .await
+            .unwrap();
+        let channel = handle.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 100, 30, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        let (mut reader, writer) = channel.split();
+
+        let received = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut received = Vec::with_capacity(OUTPUT_SIZE);
+            while received.len() < OUTPUT_SIZE {
+                match reader.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => received.extend_from_slice(&data),
+                    Some(_) => {}
+                    None => panic!("server closed before the output completed"),
+                }
+            }
+            received
+        })
+        .await
+        .unwrap();
+        assert_eq!(received.len(), OUTPUT_SIZE);
+        assert!(received.iter().all(|byte| *byte == b'L'));
+
+        writer
+            .data_bytes(b"still-interactive".to_vec())
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(russh::ChannelMsg::Data { data }) = reader.wait().await {
+                    break data;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(echoed.as_ref(), b"still-interactive");
+        drop(reader);
+        drop(writer);
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_output_preserves_utf8_wide_combining_and_ansi_bytes() {
+        let expected = concat!(
+            "\u{1b}[38;2;50;215;168m真彩色\u{1b}[0m\r\n",
+            "中文 / 🚀 / ＡＢ / e\u{301}\r\n",
+            "\u{1b}[2J\u{1b}[H"
+        )
+        .as_bytes()
+        .to_vec();
+        let (address, fingerprint, server) = start_server_with_output(expected.clone()).await;
+        let mut connection = request(address, AuthType::Password);
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            .await
+            .unwrap();
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 100, 30, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut received = Vec::with_capacity(expected.len());
+            while received.len() < expected.len() {
+                if let Some(russh::ChannelMsg::Data { data }) = channel.wait().await {
+                    received.extend_from_slice(&data);
+                }
+            }
+            received
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, expected);
         handle
             .disconnect(russh::Disconnect::ByApplication, "test complete", "")
             .await

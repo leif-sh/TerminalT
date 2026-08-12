@@ -45,3 +45,4 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - [阶段 1 架构说明](./docs/architecture/STAGE_1_SSH_MVP.md)
 - [阶段 2 架构说明](./docs/architecture/STAGE_2_CONNECTIONS_AND_CREDENTIALS.md)
 - [阶段 3 架构说明](./docs/architecture/STAGE_3_TERMINAL_EXPERIENCE.md)
+- [阶段 3 自动化验收记录](./docs/testing/STAGE_3_ACCEPTANCE.md)

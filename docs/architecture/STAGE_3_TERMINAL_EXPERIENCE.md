@@ -29,4 +29,5 @@
 
 ## 后续阶段 3 工作
 
-- 10 会话、5 MB 持续输出、中文输入法和 `vim` / `top` / `less` / `tmux` 的真实服务器验收记录；
+- 10 会话隔离、5 MiB 持续输出和字符字节流已通过 loopback SSH 自动化验证，记录见 [`../testing/STAGE_3_ACCEPTANCE.md`](../testing/STAGE_3_ACCEPTANCE.md)。
+- 中文输入法和 `vim` / `top` / `less` / `tmux` 仍需真实服务器人工验收。
