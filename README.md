@@ -1,32 +1,44 @@
-# React + TypeScript + Vite
+# TerminalT
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+TerminalT 是一个本地优先的 Windows 桌面 SSH 客户端，基于 Tauri 2、React 19、TypeScript 和 Rust 开发。
 
-Currently, two official plugins are available:
+当前开发阶段为“阶段 0：工程基础与架构骨架”。工程已经具备应用外壳、前后端 IPC 契约、模拟会话生命周期和终端渲染验证，尚未连接真实 SSH 服务器。
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 本地开发
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+启动 Tauri 桌面应用：
+
+```powershell
+npm run tauri dev
+```
+
+## 验证命令
+
+```powershell
+npm run lint
+npm test
+npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+## 目录说明
+
+- `src/components`：通用界面组件和错误边界；
+- `src/domain`：前端领域模型；
+- `src/features`：会话、终端等功能模块；
+- `src/lib`：国际化资源和 Tauri IPC 封装；
+- `src-tauri/src`：Rust 命令、错误模型和运行期会话注册表；
+- `docs/development-stages`：各阶段详细开发文档；
+- `docs/architecture`：已落地的架构决策和接口说明。
+
+## 产品与开发文档
+
+- [基础版功能开发文档](./docs/SSH_CLIENT_BASIC_VERSION.md)
+- [阶段开发文档总览](./docs/development-stages/README.md)
+- [阶段 0 架构说明](./docs/architecture/STAGE_0_FOUNDATION.md)

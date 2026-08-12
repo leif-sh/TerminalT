@@ -1,0 +1,29 @@
+export type SessionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'disconnected'
+  | 'failed'
+
+export interface SessionState {
+  id: string
+  title: string
+  status: SessionStatus
+  startedAt: string
+  lastError?: string
+}
+
+export interface SessionOutputPayload {
+  sessionId: string
+  data: number[]
+}
+
+export interface SessionStatusPayload {
+  sessionId: string
+  status: SessionStatus
+  message?: string
+}
+
+export interface TerminalSize {
+  columns: number
+  rows: number
+}

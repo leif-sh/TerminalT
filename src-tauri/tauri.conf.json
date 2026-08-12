@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "FastTerm",
-  "version": "0.1.0",
-  "identifier": "com.fastterm.desktop",
+  "productName": "TerminalT",
+  "version": "0.1.0-1",
+  "identifier": "com.terminalt.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "FastTerm",
+        "title": "TerminalT",
         "width": 800,
         "height": 600,
         "resizable": true,
