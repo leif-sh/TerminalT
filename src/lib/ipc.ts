@@ -18,7 +18,7 @@ import type {
   SaveConnectionRequest,
   StoredHostKeyRecord,
 } from '../domain/connection/types'
-import type { RemoteDirectoryListing } from '../domain/sftp/types'
+import type { RemoteDirectoryListing, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
 
 export interface HealthResponse {
   status: 'ok'
@@ -42,6 +42,7 @@ export interface KeepaliveOptions {
 type OutputHandler = (payload: SessionOutputPayload) => void
 type StatusHandler = (payload: SessionStatusPayload) => void
 type ProgressHandler = (payload: ConnectionProgressPayload) => void
+type TransferHandler = (payload: TransferProgressPayload) => void
 
 const browserOutputHandlers = new Set<OutputHandler>()
 const browserStatusHandlers = new Set<StatusHandler>()
@@ -450,6 +451,23 @@ export async function renameRemoteEntry(sessionId: string, path: string, newName
 export async function deleteRemoteEntry(sessionId: string, path: string): Promise<void> {
   if (!isTauriRuntime()) return
   await invoke('delete_remote_entry', { sessionId, path })
+}
+
+export async function startTransfer(
+  sessionId: string, direction: TransferDirection, source: string, target: string, overwrite: boolean,
+): Promise<TransferTask> {
+  if (!isTauriRuntime()) throw new Error('浏览器预览不支持真实文件传输')
+  return invoke<TransferTask>('start_transfer', { sessionId, direction, source, target, overwrite })
+}
+
+export async function cancelTransfer(sessionId: string, taskId: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('cancel_transfer', { sessionId, taskId })
+}
+
+export async function listenToTransferProgress(handler: TransferHandler): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) return () => undefined
+  return listen<TransferProgressPayload>('transfer-progress', (event) => handler(event.payload))
 }
 
 export function normalizeCommandError(error: unknown): AppCommandError {

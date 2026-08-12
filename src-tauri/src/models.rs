@@ -72,6 +72,45 @@ pub struct RemoteDirectoryListing {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferTask {
+    pub id: String,
+    pub session_id: String,
+    pub file_name: String,
+    pub direction: TransferDirection,
+    pub source: String,
+    pub target: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub bytes_per_second: u64,
+    pub status: TransferStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgressPayload {
+    pub task: TransferTask,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionRequest {

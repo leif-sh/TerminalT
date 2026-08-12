@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
 
 use crate::error::AppError;
-use crate::models::RemoteDirectoryListing;
+use crate::models::{RemoteDirectoryListing, TransferDirection, TransferTask};
 
 #[derive(Debug)]
 pub enum SessionCommand {
@@ -30,6 +30,16 @@ pub enum SessionCommand {
     DeleteRemoteEntry {
         path: String,
         response: oneshot::Sender<Result<(), AppError>>,
+    },
+    StartTransfer {
+        direction: TransferDirection,
+        source: String,
+        target: String,
+        overwrite: bool,
+        response: oneshot::Sender<Result<TransferTask, AppError>>,
+    },
+    CancelTransfer {
+        task_id: String,
     },
     Close,
 }
@@ -217,6 +227,35 @@ impl SessionRegistry {
         receiver
             .await
             .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub async fn start_transfer(
+        &self,
+        session_id: &str,
+        direction: TransferDirection,
+        source: String,
+        target: String,
+        overwrite: bool,
+    ) -> Result<TransferTask, AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::StartTransfer {
+                direction,
+                source,
+                target,
+                overwrite,
+                response,
+            })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub fn cancel_transfer(&self, session_id: &str, task_id: String) -> Result<(), AppError> {
+        self.send(session_id, SessionCommand::CancelTransfer { task_id })
     }
 
     fn ssh_commands(&self, session_id: &str) -> Result<mpsc::Sender<SessionCommand>, AppError> {

@@ -13,7 +13,7 @@ use models::{
     ConnectionRequest, ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval,
     HostKeyInspection, KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing,
     SaveConnectionRequest, SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus,
-    SessionStatusPayload,
+    SessionStatusPayload, TransferDirection, TransferTask,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -295,6 +295,32 @@ async fn delete_remote_entry(
 ) -> Result<(), AppError> {
     let path = validate_remote_path(&path)?;
     registry.delete_remote_entry(&session_id, path).await
+}
+
+#[tauri::command]
+async fn start_transfer(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    direction: TransferDirection,
+    source: String,
+    target: String,
+    overwrite: bool,
+) -> Result<TransferTask, AppError> {
+    if source.trim().is_empty() || target.trim().is_empty() {
+        return Err(AppError::validation("传输源和目标不能为空"));
+    }
+    registry
+        .start_transfer(&session_id, direction, source, target, overwrite)
+        .await
+}
+
+#[tauri::command]
+fn cancel_transfer(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    task_id: String,
+) -> Result<(), AppError> {
+    registry.cancel_transfer(&session_id, task_id)
 }
 
 #[tauri::command]
@@ -603,6 +629,8 @@ pub fn run() {
             create_remote_directory,
             rename_remote_entry,
             delete_remote_entry,
+            start_transfer,
+            cancel_transfer,
             inspect_ssh_host_key,
             test_ssh_connection,
             connect_ssh,

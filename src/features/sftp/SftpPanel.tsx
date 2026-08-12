@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { Icon } from '../../components/Icon'
-import type { RemoteDirectoryEntry, RemoteDirectoryListing } from '../../domain/sftp/types'
+import type { RemoteDirectoryEntry, RemoteDirectoryListing, TransferTask } from '../../domain/sftp/types'
 import type { SessionState } from '../../domain/session/types'
-import { createRemoteDirectory, deleteRemoteEntry, listRemoteDirectory, normalizeCommandError, renameRemoteEntry } from '../../lib/ipc'
+import { cancelTransfer, createRemoteDirectory, deleteRemoteEntry, listenToTransferProgress, listRemoteDirectory, normalizeCommandError, renameRemoteEntry, startTransfer } from '../../lib/ipc'
 
 interface SftpPanelProps {
   session: SessionState
@@ -26,6 +27,7 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
   const [dialog, setDialog] = useState<'create' | 'rename' | 'delete'>()
   const [name, setName] = useState('')
   const [mutating, setMutating] = useState(false)
+  const [tasks, setTasks] = useState<TransferTask[]>([])
 
   const browse = useCallback(async (target?: string) => {
     if (session.status !== 'connected') return
@@ -46,6 +48,16 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
   useEffect(() => {
     if (visible && !listing && !loading && !error && session.status === 'connected') void browse()
   }, [visible, listing, loading, error, session.status, browse])
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined
+    void listenToTransferProgress(({ task }) => {
+      if (task.sessionId !== session.id) return
+      setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)])
+      if (task.status === 'succeeded' && task.direction === 'upload' && listing) void browse(listing.path)
+    }).then((value) => { dispose = value })
+    return () => dispose?.()
+  }, [session.id, listing, browse])
 
   const submitPath = (event: FormEvent) => {
     event.preventDefault()
@@ -76,6 +88,33 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
     }
   }
 
+  const upload = async () => {
+    if (!listing) return
+    const source = await open({ multiple: false, directory: false })
+    if (!source) return
+    const fileName = source.replace(/\\/g, '/').split('/').pop()
+    if (!fileName) return
+    const target = `${listing.path === '/' ? '' : listing.path}/${fileName}`
+    const exists = listing.entries.some((entry) => entry.name === fileName)
+    if (exists && !window.confirm(`远端已存在“${fileName}”，确定覆盖吗？`)) return
+    try { await startTransfer(session.id, 'upload', source, target, exists) }
+    catch (cause) { setError(normalizeCommandError(cause).message) }
+  }
+
+  const download = async () => {
+    if (!selected || selected.kind !== 'file') return
+    const target = await save({ defaultPath: selected.name })
+    if (!target) return
+    try { await startTransfer(session.id, 'download', selected.path, target, true) }
+    catch (cause) { setError(normalizeCommandError(cause).message) }
+  }
+
+  const retry = async (task: TransferTask) => {
+    if (!window.confirm(`重新传输“${task.fileName}”并在目标存在时覆盖吗？`)) return
+    try { await startTransfer(session.id, task.direction, task.source, task.target, true) }
+    catch (cause) { setError(normalizeCommandError(cause).message) }
+  }
+
   return (
     <aside className="sftp-panel" hidden={!visible} aria-label={`${session.title} 文件浏览器`}>
       <header className="sftp-header">
@@ -88,6 +127,8 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
         <button type="button" disabled={loading} onClick={() => void browse(listing?.path)} aria-label="刷新">↻</button>
       </form>
       <div className="sftp-actions">
+        <button type="button" disabled={!listing || loading} onClick={() => void upload()}>上传</button>
+        <button type="button" disabled={selected?.kind !== 'file' || loading} onClick={() => void download()}>下载</button>
         <button type="button" disabled={!listing || loading} onClick={() => openDialog('create')}>新建文件夹</button>
         <button type="button" disabled={!selected || loading} onClick={() => openDialog('rename')}>重命名</button>
         <button className="danger" type="button" disabled={!selected || loading} onClick={() => openDialog('delete')}>删除</button>
@@ -114,6 +155,20 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
         </div>
       )}
       {listing?.truncated && <footer className="sftp-notice">目录超过 5000 项，仅显示前 5000 项</footer>}
+      {tasks.length > 0 && <section className="transfer-tasks" aria-label="传输任务">
+        <header><strong>传输任务</strong><span>{tasks.filter((task) => task.status === 'running' || task.status === 'queued').length} 个进行中</span><button type="button" onClick={() => setTasks((current) => current.filter((task) => task.status === 'running' || task.status === 'queued'))}>清理完成项</button></header>
+        {tasks.map((task) => {
+          const percent = task.totalBytes ? Math.min(100, task.transferredBytes / task.totalBytes * 100) : 0
+          return <div className="transfer-task" key={task.id}>
+            <div><strong>{task.direction === 'upload' ? '↑' : '↓'} {task.fileName}</strong><span>{{ queued: '排队中', running: '进行中', succeeded: '已完成', failed: '失败', cancelled: '已取消' }[task.status]}</span></div>
+            <progress value={percent} max="100" />
+            <small>{formatSize(task.transferredBytes)} / {task.totalBytes === undefined ? '未知' : formatSize(task.totalBytes)} · {formatSize(task.bytesPerSecond)}/s</small>
+            {task.error && <small className="transfer-error">{task.error}</small>}
+            {(task.status === 'queued' || task.status === 'running') && <button type="button" onClick={() => void cancelTransfer(session.id, task.id)}>取消</button>}
+            {(task.status === 'failed' || task.status === 'cancelled') && <button type="button" onClick={() => void retry(task)}>重试</button>}
+          </div>
+        })}
+      </section>}
       {dialog && (
         <div className="sftp-dialog-backdrop">
           <form className="sftp-dialog" onSubmit={submitOperation}>
