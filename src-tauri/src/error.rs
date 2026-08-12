@@ -71,6 +71,14 @@ impl AppError {
         )
     }
 
+    pub fn sftp(
+        code: &'static str,
+        message: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        Self::new(code, "sftp", message, Some(details.into()), true)
+    }
+
     pub fn operation_registry_unavailable() -> Self {
         Self::new(
             "OPERATION-REGISTRY-UNAVAILABLE",

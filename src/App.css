@@ -98,6 +98,11 @@
 .workspace { min-width: 0; flex: 1; display: grid; grid-template-rows: 68px auto minmax(0, 1fr) 32px; overflow: hidden; }
 .workspace-toolbar { display: flex; align-items: center; justify-content: space-between; padding: 0 22px; border-bottom: 1px solid var(--border); background: rgba(4, 12, 23, .7); }
 .workspace-toolbar > div { display: grid; gap: 5px; }
+.workspace-toolbar > .workspace-actions { display: flex; gap: 8px; }
+.toolbar-button { min-height: 36px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid rgba(71, 117, 178, .42); border-radius: 8px; padding: 0 12px; color: #8298b5; background: rgba(12, 31, 54, .58); cursor: pointer; font-size: 11px; }
+.toolbar-button:hover, .toolbar-button.active { color: #d8e7fa; border-color: #326ecb; background: rgba(31, 79, 148, .34); }
+.toolbar-button:disabled { opacity: .42; cursor: default; }
+.toolbar-button svg { width: 15px; }
 .workspace-context { color: #dbe6f5; font-size: 14px; font-weight: 620; }
 .workspace-state { display: flex; align-items: center; gap: 7px; color: #647892; font-size: 10px; }
 .primary-button { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid #316dd1; border-radius: 8px; padding: 0 14px; color: #eaf2ff; background: linear-gradient(180deg, #2466d7, #164ba7); box-shadow: 0 5px 18px rgba(19, 82, 190, .22), inset 0 1px 0 rgba(255, 255, 255, .12); cursor: pointer; font-size: 11px; }
@@ -116,6 +121,8 @@
 .tab-close svg { width: 13px; }
 
 .workspace-content { position: relative; min-height: 0; overflow: hidden; background: #050b15; }
+.session-surface { width: 100%; height: 100%; min-width: 0; display: flex; }
+.session-surface[hidden] { display: none; }
 .empty-workspace { height: 100%; min-height: 420px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; }
 .terminal-orbit { width: 126px; height: 126px; position: relative; display: grid; place-items: center; margin-bottom: 28px; }
 .orbit { position: absolute; inset: 0; border: 1px solid rgba(74, 113, 255, .25); border-radius: 50%; }
@@ -129,7 +136,7 @@
 .empty-workspace p { margin: 0 0 24px; color: #73869f; font-size: 12px; }
 .empty-footnote { margin-top: 13px; color: #44566d; font-size: 10px; }
 .inline-error { position: absolute; z-index: 3; top: 12px; left: 50%; transform: translateX(-50%); padding: 8px 12px; border: 1px solid rgba(251, 113, 133, .35); border-radius: 7px; color: #fecdd3; background: rgba(88, 20, 34, .88); font-size: 11px; }
-.terminal-pane { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: #050b15; }
+.terminal-pane { position: relative; flex: 1; width: auto; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #050b15; }
 .terminal-pane[hidden] { display: none; }
 .terminal-pane.terminal-theme-light { background: #f5f7fb; }
 .terminal-view { width: 100%; height: 100%; padding: 15px 14px; background: transparent; }
@@ -158,6 +165,35 @@
 .workspace-footer { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-top: 1px solid rgba(73, 114, 165, .18); color: #52667e; background: #050c17; font-size: 9px; }
 .workspace-footer span { display: flex; align-items: center; gap: 6px; }
 .workspace-footer svg { width: 13px; color: #32b98f; }
+
+.sftp-panel { width: min(390px, 42vw); min-width: 310px; height: 100%; display: grid; grid-template-rows: 48px 46px minmax(0, 1fr) auto; border-left: 1px solid rgba(63, 106, 164, .28); color: #b7c7dc; background: #07111f; box-shadow: -16px 0 40px rgba(0, 0, 0, .18); }
+.sftp-panel[hidden] { display: none; }
+.sftp-header { display: flex; align-items: center; justify-content: space-between; padding: 0 12px 0 14px; border-bottom: 1px solid rgba(62, 102, 153, .2); }
+.sftp-header > div { display: flex; align-items: center; gap: 8px; }
+.sftp-header svg { width: 15px; color: #63a0ff; }
+.sftp-header strong { color: #dbe7f6; font-size: 11px; }
+.sftp-header span { padding: 2px 5px; border-radius: 4px; color: #6f8bac; background: rgba(49, 104, 181, .17); font-size: 8px; }
+.sftp-header button { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 6px; color: #617690; background: transparent; cursor: pointer; }
+.sftp-header button:hover { color: #d7e4f4; background: rgba(79, 115, 162, .16); }
+.sftp-pathbar { display: flex; align-items: center; gap: 5px; padding: 7px 9px; border-bottom: 1px solid rgba(62, 102, 153, .2); }
+.sftp-pathbar input { min-width: 0; flex: 1; height: 30px; border: 1px solid rgba(65, 111, 170, .34); border-radius: 6px; outline: 0; padding: 0 8px; color: #c9d8e9; background: #050c17; font: 10px Consolas, monospace; }
+.sftp-pathbar input:focus { border-color: #3475d6; }
+.sftp-pathbar button { width: 30px; height: 30px; border: 1px solid rgba(65, 111, 170, .3); border-radius: 6px; color: #8298b3; background: rgba(16, 37, 62, .55); cursor: pointer; }
+.sftp-pathbar button:disabled { opacity: .35; cursor: default; }
+.sftp-list { min-height: 0; overflow: auto; padding: 5px; scrollbar-color: #29496e #07111f; scrollbar-width: thin; }
+.sftp-entry { width: 100%; min-height: 48px; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 7px; border: 0; border-radius: 6px; padding: 5px 8px; color: inherit; background: transparent; text-align: left; cursor: default; }
+.sftp-entry:hover { background: rgba(42, 83, 137, .18); }
+.sftp-entry:not(:disabled) { cursor: pointer; }
+.sftp-entry > svg { width: 17px; color: #588bcf; }
+.sftp-entry-main, .sftp-entry-meta { min-width: 0; display: grid; gap: 4px; }
+.sftp-entry-main strong { overflow: hidden; color: #c5d3e4; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 520; }
+.sftp-entry small { color: #536a85; font: 8px Consolas, monospace; }
+.sftp-entry-meta { text-align: right; }
+.sftp-entry-meta > span { color: #7489a4; font-size: 9px; }
+.sftp-loading, .sftp-empty { display: grid; place-items: center; color: #60758f; font-size: 10px; }
+.sftp-error { margin: 9px; align-self: start; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px; border: 1px solid rgba(251, 113, 133, .3); border-radius: 7px; color: #ef9ead; background: rgba(81, 20, 33, .35); font-size: 9px; }
+.sftp-error button { border: 0; color: #ffb1be; background: transparent; cursor: pointer; font-size: 9px; }
+.sftp-notice { padding: 7px 10px; border-top: 1px solid rgba(234, 179, 67, .2); color: #b4955c; font-size: 8px; }
 
 .settings-layout { width: 100%; display: flex; }
 .settings-sidebar { padding-top: 24px; }

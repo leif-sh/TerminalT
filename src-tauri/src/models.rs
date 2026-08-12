@@ -43,6 +43,35 @@ pub struct SessionStatusPayload {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: RemoteEntryKind,
+    pub size: u64,
+    pub modified_at: Option<String>,
+    pub permissions: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirectoryListing {
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub entries: Vec<RemoteDirectoryEntry>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionRequest {

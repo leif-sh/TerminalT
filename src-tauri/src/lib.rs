@@ -11,8 +11,9 @@ use error::AppError;
 use models::{
     ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile, ConnectionProgressPayload,
     ConnectionRequest, ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval,
-    HostKeyInspection, KeepaliveSettings, ReconnectSavedSessionRequest, SaveConnectionRequest,
-    SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
+    HostKeyInspection, KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing,
+    SaveConnectionRequest, SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus,
+    SessionStatusPayload,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -220,6 +221,19 @@ fn close_mock_session(
 #[tauri::command]
 fn close_session(registry: State<'_, SessionRegistry>, session_id: String) -> Result<(), AppError> {
     registry.close(&session_id)
+}
+
+#[tauri::command]
+async fn list_remote_directory(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    path: Option<String>,
+) -> Result<RemoteDirectoryListing, AppError> {
+    let path = path.unwrap_or_else(|| ".".to_owned());
+    if path.len() > 4096 || path.contains('\0') {
+        return Err(AppError::validation("远端路径无效"));
+    }
+    registry.list_remote_directory(&session_id, path).await
 }
 
 #[tauri::command]
@@ -524,6 +538,7 @@ pub fn run() {
             write_session,
             resize_session,
             close_session,
+            list_remote_directory,
             inspect_ssh_host_key,
             test_ssh_connection,
             connect_ssh,

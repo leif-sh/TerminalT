@@ -18,6 +18,7 @@ import type {
   SaveConnectionRequest,
   StoredHostKeyRecord,
 } from '../domain/connection/types'
+import type { RemoteDirectoryListing } from '../domain/sftp/types'
 
 export interface HealthResponse {
   status: 'ok'
@@ -414,6 +415,26 @@ export async function resizeSession(sessionId: string, size: TerminalSize): Prom
 export async function closeSession(sessionId: string): Promise<void> {
   if (!isTauriRuntime()) return closeMockSession(sessionId)
   await invoke('close_session', { sessionId })
+}
+
+export async function listRemoteDirectory(
+  sessionId: string,
+  path?: string,
+): Promise<RemoteDirectoryListing> {
+  if (!isTauriRuntime()) {
+    const directory = path ?? '/home/terminalt'
+    return {
+      path: directory,
+      parentPath: directory === '/' ? undefined : directory.slice(0, directory.lastIndexOf('/')) || '/',
+      truncated: false,
+      entries: [
+        { name: 'projects', path: `${directory.replace(/\/$/, '')}/projects`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwxr-xr-x' },
+        { name: '.config', path: `${directory.replace(/\/$/, '')}/.config`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwx------' },
+        { name: 'README.md', path: `${directory.replace(/\/$/, '')}/README.md`, kind: 'file', size: 1842, modifiedAt: new Date().toISOString(), permissions: '-rw-r--r--' },
+      ],
+    }
+  }
+  return invoke<RemoteDirectoryListing>('list_remote_directory', { sessionId, path })
 }
 
 export function normalizeCommandError(error: unknown): AppCommandError {

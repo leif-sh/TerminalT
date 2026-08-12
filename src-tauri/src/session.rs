@@ -4,11 +4,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
 
 use crate::error::AppError;
+use crate::models::RemoteDirectoryListing;
 
 #[derive(Debug)]
 pub enum SessionCommand {
     Data(Vec<u8>),
-    Resize { columns: u16, rows: u16 },
+    Resize {
+        columns: u16,
+        rows: u16,
+    },
+    ListRemoteDirectory {
+        path: String,
+        response: oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
+    },
     Close,
 }
 
@@ -109,6 +117,34 @@ impl SessionRegistry {
                 .map_err(|error| AppError::session_command_failed(error.to_string()))?;
         }
         Ok(())
+    }
+
+    pub async fn list_remote_directory(
+        &self,
+        session_id: &str,
+        path: String,
+    ) -> Result<RemoteDirectoryListing, AppError> {
+        let commands = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AppError::session_registry_unavailable())?;
+            match sessions
+                .get(session_id)
+                .ok_or_else(|| AppError::session_not_found(session_id))?
+            {
+                SessionEntry::Ssh { commands, .. } => commands.clone(),
+                SessionEntry::Mock { .. } => return Err(AppError::invalid_session_operation()),
+            }
+        };
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::ListRemoteDirectory { path, response })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
     }
 
     pub fn close(&self, session_id: &str) -> Result<(), AppError> {

@@ -1,6 +1,6 @@
 [package]
 name = "terminalt"
-version = "0.1.0-5"
+version = "0.1.0-6"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 russh = { version = "0.62.6", default-features = false, features = ["flate2", "ring", "rsa"] }
 tauri-plugin-dialog = "2"
 zeroize = "1"
+russh-sftp = "2.3.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem"] }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import './App.css'
 import { Icon } from './components/Icon'
 import { TerminalView } from './features/terminal/TerminalView'
+import { SftpPanel } from './features/sftp/SftpPanel'
 import { useSessionController } from './features/sessions/useSessionController'
 import { ConnectionDialog } from './features/connections/ConnectionDialog'
 import type { ConnectionAssetSnapshot, ConnectionDraft, ConnectionProfile, ConnectionRequest, HostKeyApproval, SaveConnectionRequest } from './domain/connection/types'
@@ -385,6 +386,19 @@ function SessionWorkspace({
   onReconnectSession,
   settings,
 }: SessionWorkspaceProps) {
+  const [sftpSessions, setSftpSessions] = useState<Set<string>>(() => new Set())
+  const sftpOpen = activeSessionId ? sftpSessions.has(activeSessionId) : false
+
+  const toggleSftp = () => {
+    if (!activeSessionId) return
+    setSftpSessions((current) => {
+      const next = new Set(current)
+      if (next.has(activeSessionId)) next.delete(activeSessionId)
+      else next.add(activeSessionId)
+      return next
+    })
+  }
+
   return (
     <section className="workspace" aria-label={t('workspaceTitle')}>
       <header className="workspace-toolbar">
@@ -395,10 +409,15 @@ function SessionWorkspace({
             {activeSessionId ? t('terminalReady') : '等待会话'}
           </span>
         </div>
-        <button className="primary-button" type="button" onClick={onNewConnection}>
-          <Icon name="plus" />
-          {t('newConnection')}
-        </button>
+        <div className="workspace-actions">
+          <button className={sftpOpen ? 'toolbar-button active' : 'toolbar-button'} type="button" disabled={!activeSessionId} onClick={toggleSftp}>
+            <Icon name="folder" />文件
+          </button>
+          <button className="primary-button" type="button" onClick={onNewConnection}>
+            <Icon name="plus" />
+            {t('newConnection')}
+          </button>
+        </div>
       </header>
 
       {sessions.length > 0 && (
@@ -439,15 +458,27 @@ function SessionWorkspace({
         {sessions.length === 0 ? (
           <EmptyWorkspace onNewConnection={onNewConnection} />
         ) : (
-          sessions.map((session) => (
-            <TerminalView
-              key={session.id}
-              session={session}
-              active={session.id === activeSessionId}
-              settings={settings}
-              onReconnect={() => onReconnectSession(session.id)}
-            />
-          ))
+          sessions.map((session) => {
+            const active = session.id === activeSessionId
+            const panelOpen = sftpSessions.has(session.id)
+            return (
+              <div className="session-surface" hidden={!active} key={session.id}>
+                <TerminalView
+                  session={session}
+                  active={active}
+                  settings={settings}
+                  onReconnect={() => onReconnectSession(session.id)}
+                />
+                <SftpPanel
+                  session={session}
+                  visible={active && panelOpen}
+                  onClose={() => setSftpSessions((current) => {
+                    const next = new Set(current); next.delete(session.id); return next
+                  })}
+                />
+              </div>
+            )
+          })
         )}
       </div>
 
