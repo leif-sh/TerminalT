@@ -437,6 +437,21 @@ export async function listRemoteDirectory(
   return invoke<RemoteDirectoryListing>('list_remote_directory', { sessionId, path })
 }
 
+export async function createRemoteDirectory(sessionId: string, parentPath: string, name: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('create_remote_directory', { sessionId, parentPath, name })
+}
+
+export async function renameRemoteEntry(sessionId: string, path: string, newName: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('rename_remote_entry', { sessionId, path, newName })
+}
+
+export async function deleteRemoteEntry(sessionId: string, path: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('delete_remote_entry', { sessionId, path })
+}
+
 export function normalizeCommandError(error: unknown): AppCommandError {
   if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
     const candidate = error as Partial<AppCommandError>

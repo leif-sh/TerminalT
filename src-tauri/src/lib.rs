@@ -236,6 +236,67 @@ async fn list_remote_directory(
     registry.list_remote_directory(&session_id, path).await
 }
 
+fn validate_remote_name(name: &str) -> Result<String, AppError> {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', '\0'])
+        || name.len() > 255
+    {
+        return Err(AppError::validation(
+            "名称不能为空、包含路径分隔符或超过 255 个字符",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_remote_path(path: &str) -> Result<String, AppError> {
+    let path = path.trim();
+    if !path.starts_with('/') || path.len() > 4096 || path.contains('\0') {
+        return Err(AppError::validation("远端路径无效"));
+    }
+    Ok(path.to_owned())
+}
+
+#[tauri::command]
+async fn create_remote_directory(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    parent_path: String,
+    name: String,
+) -> Result<(), AppError> {
+    let name = validate_remote_name(&name)?;
+    let parent_path = validate_remote_path(&parent_path)?;
+    registry
+        .create_remote_directory(&session_id, parent_path, name)
+        .await
+}
+
+#[tauri::command]
+async fn rename_remote_entry(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    path: String,
+    new_name: String,
+) -> Result<(), AppError> {
+    let new_name = validate_remote_name(&new_name)?;
+    let path = validate_remote_path(&path)?;
+    registry
+        .rename_remote_entry(&session_id, path, new_name)
+        .await
+}
+
+#[tauri::command]
+async fn delete_remote_entry(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    path: String,
+) -> Result<(), AppError> {
+    let path = validate_remote_path(&path)?;
+    registry.delete_remote_entry(&session_id, path).await
+}
+
 #[tauri::command]
 async fn inspect_ssh_host_key(
     app: AppHandle,
@@ -539,6 +600,9 @@ pub fn run() {
             resize_session,
             close_session,
             list_remote_directory,
+            create_remote_directory,
+            rename_remote_entry,
+            delete_remote_entry,
             inspect_ssh_host_key,
             test_ssh_connection,
             connect_ssh,
@@ -567,4 +631,24 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod sftp_validation_tests {
+    use super::{validate_remote_name, validate_remote_path};
+
+    #[test]
+    fn remote_names_reject_path_components() {
+        assert!(validate_remote_name("日志 2026").is_ok());
+        assert!(validate_remote_name("../secret").is_err());
+        assert!(validate_remote_name("a\\b").is_err());
+        assert!(validate_remote_name("..").is_err());
+    }
+
+    #[test]
+    fn mutating_operations_require_absolute_remote_paths() {
+        assert!(validate_remote_path("/home/user").is_ok());
+        assert!(validate_remote_path("relative/path").is_err());
+        assert!(validate_remote_path("/bad\0path").is_err());
+    }
 }

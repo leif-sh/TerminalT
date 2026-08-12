@@ -17,6 +17,20 @@ pub enum SessionCommand {
         path: String,
         response: oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
     },
+    CreateRemoteDirectory {
+        parent_path: String,
+        name: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+    },
+    RenameRemoteEntry {
+        path: String,
+        new_name: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+    },
+    DeleteRemoteEntry {
+        path: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+    },
     Close,
 }
 
@@ -145,6 +159,78 @@ impl SessionRegistry {
         receiver
             .await
             .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub async fn create_remote_directory(
+        &self,
+        session_id: &str,
+        parent_path: String,
+        name: String,
+    ) -> Result<(), AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::CreateRemoteDirectory {
+                parent_path,
+                name,
+                response,
+            })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub async fn rename_remote_entry(
+        &self,
+        session_id: &str,
+        path: String,
+        new_name: String,
+    ) -> Result<(), AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::RenameRemoteEntry {
+                path,
+                new_name,
+                response,
+            })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub async fn delete_remote_entry(
+        &self,
+        session_id: &str,
+        path: String,
+    ) -> Result<(), AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::DeleteRemoteEntry { path, response })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    fn ssh_commands(&self, session_id: &str) -> Result<mpsc::Sender<SessionCommand>, AppError> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AppError::session_registry_unavailable())?;
+        match sessions
+            .get(session_id)
+            .ok_or_else(|| AppError::session_not_found(session_id))?
+        {
+            SessionEntry::Ssh { commands, .. } => Ok(commands.clone()),
+            SessionEntry::Mock { .. } => Err(AppError::invalid_session_operation()),
+        }
     }
 
     pub fn close(&self, session_id: &str) -> Result<(), AppError> {

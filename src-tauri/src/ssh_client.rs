@@ -374,14 +374,16 @@ async fn run_session(
                     }
                 }
                 Some(SessionCommand::ListRemoteDirectory { path, response }) => {
-                    if let Err(error) = sftp_commands.try_send((path, response)) {
-                        let (_, response) = error.into_inner();
-                        let _ = response.send(Err(AppError::sftp(
-                            "SFTP-BUSY",
-                            "文件浏览请求过多，请稍后重试",
-                            "SFTP request queue is full or closed",
-                        )));
-                    }
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::Browse { path, response });
+                }
+                Some(SessionCommand::CreateRemoteDirectory { parent_path, name, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::CreateDirectory { parent_path, name, response });
+                }
+                Some(SessionCommand::RenameRemoteEntry { path, new_name, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::Rename { path, new_name, response });
+                }
+                Some(SessionCommand::DeleteRemoteEntry { path, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::Delete { path, response });
                 }
                 Some(SessionCommand::Close) | None => {
                     let _ = writer.close().await;
@@ -418,6 +420,7 @@ async fn run_session(
         let _ = emit_terminal_output(&app, &session_id, output_buffer);
     }
     drop(sftp_commands);
+    sftp_worker.abort();
     let _ = sftp_worker.await;
     let _ = handle
         .disconnect(Disconnect::ByApplication, "session closed", "")
@@ -433,28 +436,89 @@ async fn run_session(
     );
 }
 
+enum SftpRequest {
+    Browse {
+        path: String,
+        response: tokio::sync::oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
+    },
+    CreateDirectory {
+        parent_path: String,
+        name: String,
+        response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    },
+    Rename {
+        path: String,
+        new_name: String,
+        response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    },
+    Delete {
+        path: String,
+        response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    },
+}
+
+fn enqueue_sftp_request(sender: &mpsc::Sender<SftpRequest>, request: SftpRequest) {
+    if let Err(error) = sender.try_send(request) {
+        let failure = || {
+            AppError::sftp(
+                "SFTP-BUSY",
+                "文件操作请求过多，请稍后重试",
+                "SFTP request queue is full or closed",
+            )
+        };
+        match error.into_inner() {
+            SftpRequest::Browse { response, .. } => {
+                let _ = response.send(Err(failure()));
+            }
+            SftpRequest::CreateDirectory { response, .. }
+            | SftpRequest::Rename { response, .. }
+            | SftpRequest::Delete { response, .. } => {
+                let _ = response.send(Err(failure()));
+            }
+        }
+    }
+}
+
 async fn run_sftp_worker(
     handle: Arc<client::Handle<VerifiedHandler>>,
-    mut requests: mpsc::Receiver<(
-        String,
-        tokio::sync::oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
-    )>,
+    mut requests: mpsc::Receiver<SftpRequest>,
 ) {
     let mut sftp = None;
-    while let Some((path, response)) = requests.recv().await {
-        let result = browse_remote_directory(&handle, &mut sftp, path).await;
-        let _ = response.send(result);
+    while let Some(request) = requests.recv().await {
+        match request {
+            SftpRequest::Browse { path, response } => {
+                let _ = response.send(browse_remote_directory(&handle, &mut sftp, path).await);
+            }
+            SftpRequest::CreateDirectory {
+                parent_path,
+                name,
+                response,
+            } => {
+                let _ = response
+                    .send(create_remote_directory(&handle, &mut sftp, parent_path, name).await);
+            }
+            SftpRequest::Rename {
+                path,
+                new_name,
+                response,
+            } => {
+                let _ =
+                    response.send(rename_remote_entry(&handle, &mut sftp, path, new_name).await);
+            }
+            SftpRequest::Delete { path, response } => {
+                let _ = response.send(delete_remote_entry(&handle, &mut sftp, path).await);
+            }
+        }
     }
     if let Some(session) = sftp {
         let _ = session.close().await;
     }
 }
 
-async fn browse_remote_directory(
+async fn ensure_sftp_session<'a>(
     handle: &client::Handle<VerifiedHandler>,
-    sftp: &mut Option<SftpSession>,
-    requested_path: String,
-) -> Result<RemoteDirectoryListing, AppError> {
+    sftp: &'a mut Option<SftpSession>,
+) -> Result<&'a SftpSession, AppError> {
     if sftp.is_none() {
         let channel = handle
             .channel_open_session()
@@ -470,8 +534,15 @@ async fn browse_remote_directory(
                 .map_err(map_sftp_error)?,
         );
     }
+    Ok(sftp.as_ref().expect("SFTP session initialized above"))
+}
 
-    let session = sftp.as_ref().expect("SFTP session initialized above");
+async fn browse_remote_directory(
+    handle: &client::Handle<VerifiedHandler>,
+    sftp: &mut Option<SftpSession>,
+    requested_path: String,
+) -> Result<RemoteDirectoryListing, AppError> {
+    let session = ensure_sftp_session(handle, sftp).await?;
     let result = async {
         let path = session
             .canonicalize(requested_path)
@@ -535,6 +606,104 @@ async fn browse_remote_directory(
     result
 }
 
+async fn create_remote_directory(
+    handle: &client::Handle<VerifiedHandler>,
+    sftp: &mut Option<SftpSession>,
+    parent_path: String,
+    name: String,
+) -> Result<(), AppError> {
+    let session = ensure_sftp_session(handle, sftp).await?;
+    let parent = session
+        .canonicalize(parent_path)
+        .await
+        .map_err(map_sftp_error)?;
+    let target = join_remote_path(&parent, &name);
+    if session
+        .try_exists(target.clone())
+        .await
+        .map_err(map_sftp_error)?
+    {
+        return Err(AppError::sftp(
+            "SFTP-TARGET-EXISTS",
+            "同名文件或目录已存在",
+            target,
+        ));
+    }
+    session.create_dir(target).await.map_err(map_sftp_error)
+}
+
+async fn rename_remote_entry(
+    handle: &client::Handle<VerifiedHandler>,
+    sftp: &mut Option<SftpSession>,
+    path: String,
+    new_name: String,
+) -> Result<(), AppError> {
+    let session = ensure_sftp_session(handle, sftp).await?;
+    session
+        .symlink_metadata(path.clone())
+        .await
+        .map_err(map_sftp_error)?;
+    let parent =
+        parent_remote_path(&path).ok_or_else(|| AppError::validation("不能重命名远端根目录"))?;
+    let target = join_remote_path(&parent, &new_name);
+    if session
+        .try_exists(target.clone())
+        .await
+        .map_err(map_sftp_error)?
+    {
+        return Err(AppError::sftp(
+            "SFTP-TARGET-EXISTS",
+            "同名文件或目录已存在",
+            target,
+        ));
+    }
+    session.rename(path, target).await.map_err(map_sftp_error)
+}
+
+async fn delete_remote_entry(
+    handle: &client::Handle<VerifiedHandler>,
+    sftp: &mut Option<SftpSession>,
+    path: String,
+) -> Result<(), AppError> {
+    let session = ensure_sftp_session(handle, sftp).await?;
+    let metadata = session
+        .symlink_metadata(path.clone())
+        .await
+        .map_err(map_sftp_error)?;
+    match metadata.file_type() {
+        FileType::Dir => {
+            let mut entries = session
+                .read_dir(path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            if entries.next().is_some() {
+                return Err(AppError::sftp(
+                    "SFTP-DIRECTORY-NOT-EMPTY",
+                    "基础版不支持删除非空目录",
+                    path,
+                ));
+            }
+            session.remove_dir(path).await.map_err(map_sftp_error)
+        }
+        FileType::File | FileType::Symlink => {
+            session.remove_file(path).await.map_err(map_sftp_error)
+        }
+        FileType::Other => Err(AppError::sftp(
+            "SFTP-UNSUPPORTED-ENTRY",
+            "不支持删除此类型的远端对象",
+            path,
+        )),
+    }
+}
+
+fn join_remote_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", parent.trim_end_matches('/'))
+    }
+}
+
 fn parent_remote_path(path: &str) -> Option<String> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -558,7 +727,7 @@ fn map_sftp_error(error: russh_sftp::client::error::Error) -> AppError {
 
 #[cfg(test)]
 mod sftp_tests {
-    use super::parent_remote_path;
+    use super::{join_remote_path, parent_remote_path};
 
     #[test]
     fn derives_remote_parent_paths_without_escaping_root() {
@@ -566,6 +735,12 @@ mod sftp_tests {
         assert_eq!(parent_remote_path("/home"), Some("/".to_owned()));
         assert_eq!(parent_remote_path("/home/user/"), Some("/home".to_owned()));
         assert_eq!(parent_remote_path("relative"), None);
+    }
+
+    #[test]
+    fn joins_remote_paths_with_one_separator() {
+        assert_eq!(join_remote_path("/", "日志"), "/日志");
+        assert_eq!(join_remote_path("/home/user/", "a b"), "/home/user/a b");
     }
 }
 
