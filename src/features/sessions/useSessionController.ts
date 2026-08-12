@@ -53,8 +53,10 @@ function sessionReducer(
             ? {
                 ...session,
                 status: action.payload.status,
-                lastError:
-                  action.payload.status === 'failed' ? action.payload.message : undefined,
+                lastError: action.payload.status === 'failed' ? action.payload.message : undefined,
+                disconnectReason: action.payload.status === 'disconnected'
+                  ? action.payload.message
+                  : undefined,
               }
             : session,
         ),
@@ -62,13 +64,14 @@ function sessionReducer(
     case 'activated':
       return { ...state, activeSessionId: action.sessionId }
     case 'closed': {
+      const closedIndex = state.sessions.findIndex((session) => session.id === action.sessionId)
       const remaining = state.sessions.filter((session) => session.id !== action.sessionId)
       return {
         ...state,
         sessions: remaining,
         activeSessionId:
           state.activeSessionId === action.sessionId
-            ? remaining.at(-1)?.id
+            ? remaining[Math.min(closedIndex, remaining.length - 1)]?.id
             : state.activeSessionId,
       }
     }

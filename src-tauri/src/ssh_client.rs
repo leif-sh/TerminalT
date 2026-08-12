@@ -320,14 +320,21 @@ async fn run_session(
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
     let (mut reader, writer) = channel.split();
-    let mut final_message = "远端会话已关闭".to_owned();
-    loop {
+    let mut output_buffer = Vec::with_capacity(64 * 1024);
+    let mut output_flush = tokio::time::interval(Duration::from_millis(16));
+    output_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    output_flush.tick().await;
+    let final_message = loop {
         tokio::select! {
+            _ = output_flush.tick(), if !output_buffer.is_empty() => {
+                if let Err(error) = emit_terminal_output(&app, &session_id, std::mem::take(&mut output_buffer)) {
+                    break format!("终端数据发送失败：{}", error.message);
+                }
+            }
             command = commands.recv() => match command {
                 Some(SessionCommand::Data(data)) => {
                     if let Err(error) = writer.data_bytes(data).await {
-                        final_message = format!("网络写入失败：{error}");
-                        break;
+                        break format!("网络写入失败：{error}");
                     }
                 }
                 Some(SessionCommand::Resize { columns, rows }) => {
@@ -336,31 +343,39 @@ async fn run_session(
                     }
                 }
                 Some(SessionCommand::Close) | None => {
-                    final_message = "会话已关闭".to_owned();
                     let _ = writer.close().await;
-                    break;
+                    break "会话已关闭".to_owned();
                 }
             },
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    if let Err(error) = app.emit(SESSION_OUTPUT_EVENT, SessionOutputPayload {
-                        session_id: session_id.clone(),
-                        data: data.to_vec(),
-                    }) {
-                        final_message = format!("终端数据发送失败：{error}");
-                        break;
+                    output_buffer.extend_from_slice(&data);
+                    if output_buffer.len() >= 64 * 1024 {
+                        if let Err(error) = emit_terminal_output(&app, &session_id, std::mem::take(&mut output_buffer)) {
+                            break format!("终端数据发送失败：{}", error.message);
+                        }
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    final_message = format!("远端 Shell 已退出，状态码 {exit_status}");
-                    break;
+                    break format!("远端 Shell 已退出，状态码 {exit_status}");
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(ChannelMsg::Eof) => {
+                    break "远端 Shell 已结束输出".to_owned();
+                }
+                Some(ChannelMsg::Close) => {
+                    break "服务器已关闭当前会话".to_owned();
+                }
+                None => {
+                    break "网络连接已中断或服务器已关闭会话".to_owned();
+                }
                 _ => {}
             }
         }
-    }
+    };
 
+    if !output_buffer.is_empty() {
+        let _ = emit_terminal_output(&app, &session_id, output_buffer);
+    }
     let _ = handle
         .disconnect(Disconnect::ByApplication, "session closed", "")
         .await;
@@ -375,9 +390,22 @@ async fn run_session(
     );
 }
 
+fn emit_terminal_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Result<(), AppError> {
+    app.emit(
+        SESSION_OUTPUT_EVENT,
+        SessionOutputPayload {
+            session_id: session_id.to_owned(),
+            data,
+        },
+    )
+    .map_err(|error| AppError::event_delivery_failed(SESSION_OUTPUT_EVENT, error))
+}
+
 fn client_config() -> client::Config {
     client::Config {
         nodelay: true,
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 3,
         ..Default::default()
     }
 }

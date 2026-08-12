@@ -2,7 +2,7 @@
 
 TerminalT 是一个本地优先的 Windows 桌面 SSH 客户端，基于 Tauri 2、React 19、TypeScript 和 Rust 开发。
 
-当前已完成“阶段 2：连接资产与安全凭据”。应用支持连接与单层分组持久化、搜索、编辑、复制、删除、快速连接和 Windows 凭据库，并保留阶段 1 的真实 SSH 单会话能力。
+当前已完成“阶段 2：连接资产与安全凭据”，并已进入“阶段 3：多会话与完整终端体验”开发。应用现已支持多个独立 SSH 标签、标签快捷键、终端搜索、安全粘贴、右键操作、即时显示设置、输出批处理和 SSH keepalive。
 
 ## 本地开发
 
@@ -44,3 +44,4 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - [阶段 0 架构说明](./docs/architecture/STAGE_0_FOUNDATION.md)
 - [阶段 1 架构说明](./docs/architecture/STAGE_1_SSH_MVP.md)
 - [阶段 2 架构说明](./docs/architecture/STAGE_2_CONNECTIONS_AND_CREDENTIALS.md)
+- [阶段 3 架构说明](./docs/architecture/STAGE_3_TERMINAL_EXPERIENCE.md)

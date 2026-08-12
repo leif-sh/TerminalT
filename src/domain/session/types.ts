@@ -12,6 +12,7 @@ export interface SessionState {
   status: SessionStatus
   startedAt: string
   lastError?: string
+  disconnectReason?: string
 }
 
 export interface SessionOutputPayload {

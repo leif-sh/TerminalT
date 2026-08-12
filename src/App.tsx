@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import './App.css'
 import { Icon } from './components/Icon'
 import { TerminalView } from './features/terminal/TerminalView'
@@ -12,8 +12,11 @@ import {
   saveConnectionProfile, type HealthResponse,
 } from './lib/ipc'
 import { t } from './lib/i18n'
+import type { TerminalSettings } from './domain/terminal/settings'
+import { normalizeTerminalSettings } from './domain/terminal/settings'
 
 type View = 'connections' | 'settings'
+const terminalSettingsKey = 'terminalt-terminal-settings-v1'
 
 function App() {
   const [view, setView] = useState<View>('connections')
@@ -24,6 +27,7 @@ function App() {
   const [quickSource, setQuickSource] = useState<string>()
   const [assets, setAssets] = useState<ConnectionAssetSnapshot>()
   const [assetError, setAssetError] = useState<string>()
+  const [terminalSettings, setTerminalSettings] = useState(readTerminalSettings)
   const {
     sessions,
     activeSessionId,
@@ -66,6 +70,48 @@ function App() {
   }, [])
 
   useEffect(() => { void refreshAssets() }, [])
+
+  useEffect(() => {
+    localStorage.setItem(terminalSettingsKey, JSON.stringify(terminalSettings))
+  }, [terminalSettings])
+
+  const requestCloseSession = useCallback(async (sessionId: string) => {
+    const session = sessions.find((candidate) => candidate.id === sessionId)
+    if (!session) return
+    if (
+      terminalSettings.confirmCloseSession
+      && session.status === 'connected'
+      && !window.confirm(`关闭“${session.title}”？会话将断开。`)
+    ) return
+    await closeSession(sessionId)
+  }, [closeSession, sessions, terminalSettings.confirmCloseSession])
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (connectionDialogOpen || view !== 'connections') return
+      const target = event.target as HTMLElement | null
+      if (target?.matches('input, select, textarea') && !target.closest('.xterm')) return
+      if (!event.ctrlKey || event.altKey || event.metaKey) return
+      if (event.key.toLowerCase() === 'w' && activeSessionId) {
+        event.preventDefault()
+        void requestCloseSession(activeSessionId)
+        return
+      }
+      if (event.key === 'Tab' && sessions.length > 1) {
+        event.preventDefault()
+        const index = sessions.findIndex((session) => session.id === activeSessionId)
+        activateSession(sessions[(index + 1) % sessions.length].id)
+        return
+      }
+      const tabNumber = Number(event.key)
+      if (tabNumber >= 1 && tabNumber <= 9 && sessions[tabNumber - 1]) {
+        event.preventDefault()
+        activateSession(sessions[tabNumber - 1].id)
+      }
+    }
+    window.addEventListener('keydown', handleShortcut)
+    return () => window.removeEventListener('keydown', handleShortcut)
+  }, [activeSessionId, activateSession, connectionDialogOpen, requestCloseSession, sessions, view])
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
 
@@ -114,7 +160,6 @@ function App() {
         {view === 'connections' ? (
           <>
             <ConnectionsPanel
-              hasSession={sessions.length > 0}
               assets={assets}
               activeSessionTitles={new Set(sessions.map((session) => session.title))}
               error={assetError}
@@ -142,11 +187,12 @@ function App() {
               error={error}
               onNewConnection={() => { setQuickSource(undefined); setDialogDraft(undefined); setConnectionDialogOpen(true) }}
               onActivateSession={activateSession}
-              onCloseSession={closeSession}
+              settings={terminalSettings}
+              onCloseSession={requestCloseSession}
             />
           </>
         ) : (
-          <SettingsView />
+          <SettingsView settings={terminalSettings} onChange={setTerminalSettings} />
         )}
       </section>
       <ConnectionDialog
@@ -170,7 +216,6 @@ function App() {
 }
 
 interface ConnectionsPanelProps {
-  hasSession: boolean
   assets?: ConnectionAssetSnapshot
   activeSessionTitles: Set<string>
   error?: string
@@ -184,7 +229,7 @@ interface ConnectionsPanelProps {
   onDeleteGroup: (id: string, name: string) => Promise<void>
 }
 
-function ConnectionsPanel({ hasSession, assets, activeSessionTitles, error, onNewConnection, onOpenConnection, onQuickConnection, onCopy, onDelete, onCreateGroup, onRenameGroup, onDeleteGroup }: ConnectionsPanelProps) {
+function ConnectionsPanel({ assets, activeSessionTitles, error, onNewConnection, onOpenConnection, onQuickConnection, onCopy, onDelete, onCreateGroup, onRenameGroup, onDeleteGroup }: ConnectionsPanelProps) {
   const [query, setQuery] = useState('')
   const [quickTarget, setQuickTarget] = useState('')
   const [quickError, setQuickError] = useState<string>()
@@ -207,7 +252,7 @@ function ConnectionsPanel({ hasSession, assets, activeSessionTitles, error, onNe
           <span className="eyebrow">SSH</span>
           <h1>{t('connectionCenter')}</h1>
         </div>
-        <button className="icon-button" type="button" onClick={onNewConnection} disabled={hasSession} aria-label={t('newConnection')} title={hasSession ? '阶段 1 仅支持单会话' : t('newConnection')}>
+        <button className="icon-button" type="button" onClick={onNewConnection} aria-label={t('newConnection')} title={t('newConnection')}>
           <Icon name="plus" />
         </button>
       </header>
@@ -232,7 +277,7 @@ function ConnectionsPanel({ hasSession, assets, activeSessionTitles, error, onNe
             <span><Icon name="chevron" />{group.name}</span>
             <span className="group-tools"><span className="count-badge">{profiles.length}</span>{group.id !== assets.defaultGroupId && <><button type="button" aria-label={`重命名${group.name}`} onClick={() => { const name = window.prompt('新的分组名称', group.name); if (name?.trim()) void onRenameGroup(group.id, name.trim()) }}>✎</button><button type="button" aria-label={`删除${group.name}`} onClick={() => void onDeleteGroup(group.id, group.name)}>×</button></>}</span>
           </div>
-          {profiles.map((profile) => <article className={selectedId === profile.id ? 'connection-list-item selected' : 'connection-list-item'} key={profile.id} onDoubleClick={() => !hasSession && onOpenConnection(profile)}>
+          {profiles.map((profile) => <article className={selectedId === profile.id ? 'connection-list-item selected' : 'connection-list-item'} key={profile.id} onDoubleClick={() => onOpenConnection(profile)}>
             <span className="connection-list-icon"><Icon name="server" /></span>
             <button className="connection-main" type="button" onClick={() => setSelectedId(profile.id)}><strong><span className={`status-dot ${activeSessionTitles.has(profile.name) ? 'online' : ''}`} />{profile.name}</strong><span>{profile.username}@{profile.host}:{profile.port}</span></button>
             <div className="connection-actions"><button type="button" onClick={() => onOpenConnection(profile)} aria-label={`编辑${profile.name}`}>✎</button><button type="button" onClick={() => void onCopy(profile.id)} aria-label={`复制${profile.name}`}>⧉</button><button type="button" onClick={() => void onDelete(profile)} aria-label={`删除${profile.name}`}>×</button></div>
@@ -254,7 +299,7 @@ function ConnectionsPanel({ hasSession, assets, activeSessionTitles, error, onNe
         </div>
         <input className="quick-target" value={quickTarget} onChange={(event) => setQuickTarget(event.target.value)} placeholder="user@host:22" aria-label="快速连接目标" />
         {quickError && <span className="quick-error">{quickError}</span>}
-        <button type="button" onClick={openQuick} disabled={hasSession}>{hasSession ? '已有活动会话' : '继续'}</button>
+        <button type="button" onClick={openQuick}>继续</button>
       </div>
     </aside>
   )
@@ -268,6 +313,7 @@ interface SessionWorkspaceProps {
   onNewConnection: () => void
   onActivateSession: (sessionId: string) => void
   onCloseSession: (sessionId: string) => Promise<void>
+  settings: TerminalSettings
 }
 
 function SessionWorkspace({
@@ -278,6 +324,7 @@ function SessionWorkspace({
   onNewConnection,
   onActivateSession,
   onCloseSession,
+  settings,
 }: SessionWorkspaceProps) {
   return (
     <section className="workspace" aria-label={t('workspaceTitle')}>
@@ -289,7 +336,7 @@ function SessionWorkspace({
             {activeSessionId ? t('terminalReady') : '等待会话'}
           </span>
         </div>
-        <button className="primary-button" type="button" onClick={onNewConnection} disabled={sessions.length > 0}>
+        <button className="primary-button" type="button" onClick={onNewConnection}>
           <Icon name="plus" />
           {t('newConnection')}
         </button>
@@ -338,6 +385,7 @@ function SessionWorkspace({
               key={session.id}
               session={session}
               active={session.id === activeSessionId}
+              settings={settings}
             />
           ))
         )}
@@ -373,31 +421,40 @@ function EmptyWorkspace({
   )
 }
 
-function SettingsView() {
+function SettingsView({ settings, onChange }: { settings: TerminalSettings; onChange: (settings: TerminalSettings) => void }) {
+  const update = <Key extends keyof TerminalSettings>(key: Key, value: TerminalSettings[Key]) => {
+    onChange(normalizeTerminalSettings({ ...settings, [key]: value }))
+  }
   return (
     <section className="settings-layout">
       <aside className="settings-sidebar">
         <header className="panel-header">
           <div><span className="eyebrow">PREFERENCES</span><h1>{t('settings')}</h1></div>
         </header>
-        <button className="settings-nav active" type="button"><Icon name="settings" />{t('generalSettings')}</button>
-        <button className="settings-nav" type="button" disabled><Icon name="terminal" />{t('terminalSettings')}<span>{t('comingLater')}</span></button>
+        <button className="settings-nav" type="button"><Icon name="settings" />{t('generalSettings')}</button>
+        <button className="settings-nav active" type="button"><Icon name="terminal" />{t('terminalSettings')}</button>
       </aside>
       <div className="settings-content">
         <header>
-          <span className="eyebrow">APPLICATION</span>
-          <h2>{t('settingsTitle')}</h2>
-          <p>{t('settingsDescription')}</p>
+          <span className="eyebrow">TERMINAL</span>
+          <h2>终端显示与会话</h2>
+          <p>修改会立即应用到所有已打开终端，并同步更新远端 PTY 尺寸。</p>
         </header>
         <div className="settings-card">
-          <SettingRow icon="shield" label={t('theme')} value={t('darkTheme')} />
-          <SettingRow icon="connection" label={t('language')} value={t('simplifiedChinese')} />
+          <SettingControl label="字体族" hint="优先使用已安装的等宽字体"><input value={settings.fontFamily} onChange={(event) => update('fontFamily', event.target.value)} /></SettingControl>
+          <SettingControl label="字号" hint="10～32 px"><input type="number" min="10" max="32" value={settings.fontSize} onChange={(event) => update('fontSize', Number(event.target.value))} /></SettingControl>
+          <SettingControl label="行高" hint="1.0～2.0"><input type="number" min="1" max="2" step="0.1" value={settings.lineHeight} onChange={(event) => update('lineHeight', Number(event.target.value))} /></SettingControl>
+          <SettingControl label="终端主题" hint="内置浅色与深色主题"><select value={settings.theme} onChange={(event) => update('theme', event.target.value as TerminalSettings['theme'])}><option value="dark">深色</option><option value="light">浅色</option></select></SettingControl>
+          <SettingControl label="光标形状" hint="块、竖线或下划线"><select value={settings.cursorStyle} onChange={(event) => update('cursorStyle', event.target.value as TerminalSettings['cursorStyle'])}><option value="block">块</option><option value="bar">竖线</option><option value="underline">下划线</option></select></SettingControl>
+          <SettingControl label="光标闪烁" hint="应用到全部会话"><input type="checkbox" checked={settings.cursorBlink} onChange={(event) => update('cursorBlink', event.target.checked)} /></SettingControl>
+          <SettingControl label="滚动缓冲" hint="1,000～100,000 行"><input type="number" min="1000" max="100000" step="1000" value={settings.scrollback} onChange={(event) => update('scrollback', Number(event.target.value))} /></SettingControl>
+          <SettingControl label="关闭会话确认" hint="连接中的标签关闭前提示"><input type="checkbox" checked={settings.confirmCloseSession} onChange={(event) => update('confirmCloseSession', event.target.checked)} /></SettingControl>
         </div>
         <div className="architecture-note">
           <Icon name="server" />
           <div>
-            <strong>设置结构已就绪</strong>
-            <span>统一配置服务与持久化将在对应功能阶段接入。</span>
+            <strong>设置已自动保存</strong>
+            <span>终端设置保存在本机，不包含服务器或凭据信息。</span>
           </div>
         </div>
       </div>
@@ -405,14 +462,22 @@ function SettingsView() {
   )
 }
 
-function SettingRow({ icon, label, value }: { icon: 'shield' | 'connection'; label: string; value: string }) {
+function SettingControl({ label, hint, children }: { label: string; hint: string; children: ReactNode }) {
   return (
     <div className="setting-row">
-      <span className="setting-icon"><Icon name={icon} /></span>
-      <div><strong>{label}</strong><span>全局应用设置</span></div>
-      <button type="button" disabled>{value}<Icon name="chevron" /></button>
+      <span className="setting-icon"><Icon name="terminal" /></span>
+      <div><strong>{label}</strong><span>{hint}</span></div>
+      <div className="setting-control">{children}</div>
     </div>
   )
+}
+
+function readTerminalSettings(): TerminalSettings {
+  try {
+    return normalizeTerminalSettings(JSON.parse(localStorage.getItem(terminalSettingsKey) ?? 'null'))
+  } catch {
+    return normalizeTerminalSettings(null)
+  }
 }
 
 export default App
