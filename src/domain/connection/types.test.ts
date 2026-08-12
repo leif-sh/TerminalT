@@ -2,12 +2,27 @@ import { describe, expect, it } from 'vitest'
 import {
   initialConnectionDraft,
   toConnectionRequest,
+  toReconnectDraft,
   validateConnectionDraft,
   parseQuickTarget,
   filterConnections,
 } from './types'
 
 describe('connection form', () => {
+  it('removes temporary secrets from reconnect state', () => {
+    const reconnect = toReconnectDraft({
+      ...initialConnectionDraft,
+      name: 'server',
+      host: 'example.com',
+      username: 'user',
+      password: 'temporary-password',
+      privateKeyPassphrase: 'temporary-passphrase',
+    })
+
+    expect(reconnect.password).toBe('')
+    expect(reconnect.privateKeyPassphrase).toBe('')
+  })
+
   it('requires a host, username, and password', () => {
     expect(validateConnectionDraft(initialConnectionDraft)).toMatchObject({
       name: expect.any(String),

@@ -361,6 +361,8 @@ impl AssetStore {
             columns: 80,
             rows: 24,
             timeout_seconds: profile.timeout_seconds,
+            keepalive_enabled: true,
+            keepalive_seconds: 30,
         })
     }
 

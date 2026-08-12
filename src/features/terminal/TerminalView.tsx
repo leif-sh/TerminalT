@@ -12,6 +12,7 @@ interface TerminalViewProps {
   session: SessionState
   active: boolean
   settings: TerminalSettings
+  onReconnect: () => void
 }
 
 interface SearchResult {
@@ -24,7 +25,7 @@ interface ContextMenuPosition {
   y: number
 }
 
-export function TerminalView({ session, active, settings }: TerminalViewProps) {
+export function TerminalView({ session, active, settings, onReconnect }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | undefined>(undefined)
   const fitAddonRef = useRef<FitAddon | undefined>(undefined)
@@ -142,6 +143,13 @@ export function TerminalView({ session, active, settings }: TerminalViewProps) {
   }, [session.id, settings])
 
   useEffect(() => {
+    if (!session.reconnectGeneration) return
+    terminalRef.current?.write(
+      '\r\n\u001b[38;2;95;140;255m──────── 正在建立新会话 ────────\u001b[0m\r\n',
+    )
+  }, [session.reconnectGeneration])
+
+  useEffect(() => {
     if (active && !searchOpen) terminalRef.current?.focus()
   }, [active, searchOpen])
 
@@ -191,8 +199,9 @@ export function TerminalView({ session, active, settings }: TerminalViewProps) {
       )}
       {session.status !== 'connected' && (
         <div className="terminal-disconnected" role="status">
-          <strong>{session.status === 'failed' ? '连接失败' : '会话已断开'}</strong>
-          <span>{session.lastError ?? session.disconnectReason ?? '远端会话不可用'}</span>
+          <strong>{session.reconnecting ? '正在重新连接' : session.status === 'failed' ? '连接失败' : '会话已断开'}</strong>
+          <span>{session.reconnecting ? '正在创建全新的 SSH session、PTY 和 Shell…' : session.lastError ?? session.disconnectReason ?? '远端会话不可用'}</span>
+          {!session.reconnecting && <button type="button" onClick={onReconnect}>重新连接</button>}
         </div>
       )}
       <div

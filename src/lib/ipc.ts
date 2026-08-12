@@ -33,6 +33,11 @@ export interface AppCommandError {
   retryable: boolean
 }
 
+export interface KeepaliveOptions {
+  enabled: boolean
+  seconds: number
+}
+
 type OutputHandler = (payload: SessionOutputPayload) => void
 type StatusHandler = (payload: SessionStatusPayload) => void
 type ProgressHandler = (payload: ConnectionProgressPayload) => void
@@ -277,13 +282,17 @@ export async function testSavedConnection(
   connectionId: string,
   temporarySecret: string | undefined,
   approval: HostKeyApproval,
+  keepalive: KeepaliveOptions,
 ): Promise<ConnectionTestResult> {
   if (!isTauriRuntime()) {
     const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
     if (!profile) throw new Error('连接不存在')
     return testSshConnection(operationId, toPreviewRequest(profile, temporarySecret), approval)
   }
-  return invoke<ConnectionTestResult>('test_saved_connection', { operationId, connectionId, temporarySecret, approval })
+  return invoke<ConnectionTestResult>('test_saved_connection', {
+    operationId,
+    request: { connectionId, temporarySecret, approval, keepalive },
+  })
 }
 
 export async function connectSavedConnection(
@@ -291,13 +300,57 @@ export async function connectSavedConnection(
   connectionId: string,
   temporarySecret: string | undefined,
   approval: HostKeyApproval,
+  keepalive: KeepaliveOptions,
 ): Promise<SessionState> {
   if (!isTauriRuntime()) {
     const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
     if (!profile) throw new Error('连接不存在')
     return connectSsh(operationId, toPreviewRequest(profile, temporarySecret), approval)
   }
-  return invoke<SessionState>('connect_saved_connection', { operationId, connectionId, temporarySecret, approval })
+  return invoke<SessionState>('connect_saved_connection', {
+    operationId,
+    request: { connectionId, temporarySecret, approval, keepalive },
+  })
+}
+
+export async function reconnectSsh(
+  operationId: string,
+  sessionId: string,
+  request: ConnectionRequest,
+  approval: HostKeyApproval,
+): Promise<SessionState> {
+  if (!isTauriRuntime()) {
+    await new Promise((resolve) => window.setTimeout(resolve, 120))
+    const session: SessionState = {
+      id: sessionId,
+      title: request.name,
+      status: 'connected',
+      startedAt: new Date().toISOString(),
+    }
+    browserStatusHandlers.forEach((handler) => handler({ sessionId, status: 'connected' }))
+    emitBrowserOutput(sessionId, '\u001b[32mReconnected.\u001b[0m\r\n\u001b[36mterminalt\u001b[0m $ ')
+    return session
+  }
+  return invoke<SessionState>('reconnect_ssh', { operationId, sessionId, request, approval })
+}
+
+export async function reconnectSavedConnection(
+  operationId: string,
+  sessionId: string,
+  connectionId: string,
+  temporarySecret: string | undefined,
+  approval: HostKeyApproval,
+  keepalive: KeepaliveOptions,
+): Promise<SessionState> {
+  if (!isTauriRuntime()) {
+    const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
+    if (!profile) throw new Error('连接不存在')
+    return reconnectSsh(operationId, sessionId, toPreviewRequest(profile, temporarySecret), approval)
+  }
+  return invoke<SessionState>('reconnect_saved_connection', {
+    operationId,
+    request: { sessionId, connectionId, temporarySecret, approval, keepalive },
+  })
 }
 
 function toPreviewRequest(profile: ConnectionProfile, secret?: string): ConnectionRequest {
@@ -311,6 +364,8 @@ function toPreviewRequest(profile: ConnectionProfile, secret?: string): Connecti
     privateKeyPath: profile.privateKeyPath ?? '',
     privateKeyPassphrase: profile.authType === 'privateKey' ? secret ?? '' : '',
     timeoutSeconds: profile.timeoutSeconds,
+    keepaliveEnabled: true,
+    keepaliveSeconds: 30,
     columns: 80,
     rows: 24,
   }

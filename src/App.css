@@ -144,6 +144,7 @@
 .terminal-disconnected { position: absolute; z-index: 4; right: 20px; bottom: 18px; max-width: 420px; display: grid; gap: 3px; padding: 9px 12px; border: 1px solid rgba(251, 113, 133, .35); border-radius: 8px; color: #fecdd3; background: rgba(72, 18, 30, .9); box-shadow: 0 10px 24px rgba(0, 0, 0, .32); }
 .terminal-disconnected strong { font-size: 10px; }
 .terminal-disconnected span { color: #d8919d; font-size: 9px; }
+.terminal-disconnected button { justify-self: end; margin-top: 5px; border: 1px solid rgba(251, 113, 133, .42); border-radius: 6px; padding: 5px 9px; color: #fecdd3; background: rgba(116, 31, 47, .42); cursor: pointer; font-size: 9px; }
 .terminal-context-menu { position: fixed; z-index: 30; width: 126px; display: grid; gap: 2px; padding: 5px; border: 1px solid rgba(79, 132, 201, .4); border-radius: 8px; background: #09182a; box-shadow: 0 16px 40px rgba(0, 0, 0, .5); }
 .terminal-context-menu button { height: 30px; border: 0; border-radius: 5px; padding: 0 10px; color: #aebed2; background: transparent; text-align: left; cursor: pointer; font-size: 10px; }
 .terminal-context-menu button:hover { color: #e4edf9; background: rgba(67, 122, 205, .2); }

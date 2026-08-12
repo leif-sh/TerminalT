@@ -11,6 +11,8 @@ export interface TerminalSettings {
   cursorBlink: boolean
   scrollback: number
   confirmCloseSession: boolean
+  keepaliveEnabled: boolean
+  keepaliveSeconds: number
 }
 
 export const defaultTerminalSettings: TerminalSettings = {
@@ -22,6 +24,8 @@ export const defaultTerminalSettings: TerminalSettings = {
   cursorBlink: true,
   scrollback: 10_000,
   confirmCloseSession: true,
+  keepaliveEnabled: true,
+  keepaliveSeconds: 30,
 }
 
 export const terminalThemes: Record<TerminalThemeName, ITheme> = {
@@ -63,6 +67,10 @@ export function normalizeTerminalSettings(value: unknown): TerminalSettings {
     confirmCloseSession: typeof input.confirmCloseSession === 'boolean'
       ? input.confirmCloseSession
       : defaultTerminalSettings.confirmCloseSession,
+    keepaliveEnabled: typeof input.keepaliveEnabled === 'boolean'
+      ? input.keepaliveEnabled
+      : defaultTerminalSettings.keepaliveEnabled,
+    keepaliveSeconds: clampNumber(input.keepaliveSeconds, 5, 300, defaultTerminalSettings.keepaliveSeconds),
   }
 }
 

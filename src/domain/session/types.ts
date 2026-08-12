@@ -13,6 +13,8 @@ export interface SessionState {
   startedAt: string
   lastError?: string
   disconnectReason?: string
+  reconnectGeneration?: number
+  reconnecting?: boolean
 }
 
 export interface SessionOutputPayload {

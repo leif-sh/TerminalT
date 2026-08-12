@@ -8,6 +8,8 @@ describe('terminal settings', () => {
       fontSize: 14,
       cursorStyle: 'bar',
       confirmCloseSession: true,
+      keepaliveEnabled: true,
+      keepaliveSeconds: 30,
     })
   })
 
@@ -16,6 +18,13 @@ describe('terminal settings', () => {
       fontSize: 32,
       lineHeight: 1,
       scrollback: 1_000,
+    })
+  })
+
+  it('normalizes keepalive preferences', () => {
+    expect(normalizeTerminalSettings({ keepaliveEnabled: false, keepaliveSeconds: 999 })).toMatchObject({
+      keepaliveEnabled: false,
+      keepaliveSeconds: 300,
     })
   })
 })

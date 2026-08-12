@@ -5,7 +5,7 @@ import { TerminalView } from './features/terminal/TerminalView'
 import { useSessionController } from './features/sessions/useSessionController'
 import { ConnectionDialog } from './features/connections/ConnectionDialog'
 import type { ConnectionAssetSnapshot, ConnectionDraft, ConnectionProfile, ConnectionRequest, HostKeyApproval, SaveConnectionRequest } from './domain/connection/types'
-import { draftFromProfile, filterConnections, initialConnectionDraft, parseQuickTarget } from './domain/connection/types'
+import { draftFromProfile, filterConnections, initialConnectionDraft, parseQuickTarget, toReconnectDraft } from './domain/connection/types'
 import {
   copyConnectionProfile, deleteConnectionGroup, deleteConnectionProfile, healthCheck,
   listConnectionAssets, normalizeCommandError, recordRecentTarget, saveConnectionGroup,
@@ -27,6 +27,7 @@ function App() {
   const [quickSource, setQuickSource] = useState<string>()
   const [assets, setAssets] = useState<ConnectionAssetSnapshot>()
   const [assetError, setAssetError] = useState<string>()
+  const [reconnectSessionId, setReconnectSessionId] = useState<string>()
   const [terminalSettings, setTerminalSettings] = useState(readTerminalSettings)
   const {
     sessions,
@@ -34,6 +35,8 @@ function App() {
     error,
     startSession,
     startSavedSession,
+    reconnectSession,
+    reconnectSavedSession,
     closeSession,
     activateSession,
   } = useSessionController()
@@ -114,6 +117,21 @@ function App() {
   }, [activeSessionId, activateSession, connectionDialogOpen, requestCloseSession, sessions, view])
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
+  const reconnectTarget = sessions.find((session) => session.id === reconnectSessionId)
+  const closeConnectionDialog = () => {
+    setConnectionDialogOpen(false)
+    setDialogDraft(undefined)
+    setQuickSource(undefined)
+    setReconnectSessionId(undefined)
+  }
+  const openReconnect = (sessionId: string) => {
+    const session = sessions.find((candidate) => candidate.id === sessionId)
+    if (!session || session.reconnecting) return
+    setQuickSource(undefined)
+    setReconnectSessionId(sessionId)
+    setDialogDraft(session.reconnectSource.draft)
+    setConnectionDialogOpen(true)
+  }
 
   return (
     <main className="app-shell">
@@ -189,6 +207,7 @@ function App() {
               onActivateSession={activateSession}
               settings={terminalSettings}
               onCloseSession={requestCloseSession}
+              onReconnectSession={openReconnect}
             />
           </>
         ) : (
@@ -197,17 +216,55 @@ function App() {
       </section>
       <ConnectionDialog
         open={connectionDialogOpen}
+        reconnecting={Boolean(reconnectTarget)}
+        keepalive={{
+          enabled: terminalSettings.keepaliveEnabled,
+          seconds: terminalSettings.keepaliveSeconds,
+        }}
         initialDraft={dialogDraft}
         groups={assets?.groups}
-        onClose={() => { setConnectionDialogOpen(false); setDialogDraft(undefined); setQuickSource(undefined) }}
-        onSave={quickSource ? undefined : async (request: SaveConnectionRequest) => { await saveConnectionProfile(request); await refreshAssets() }}
+        onClose={closeConnectionDialog}
+        onSave={quickSource || reconnectTarget ? undefined : async (request: SaveConnectionRequest) => { await saveConnectionProfile(request); await refreshAssets() }}
         onConnect={async (
           operationId: string,
           request: ConnectionRequest,
           approval: HostKeyApproval,
-        ) => { await startSession(operationId, request, approval); if (quickSource) await recordRecentTarget(quickSource) }}
+        ) => {
+          if (reconnectTarget) {
+            await reconnectSession(reconnectTarget.id, operationId, request, approval)
+          } else {
+            await startSession(operationId, request, approval, toReconnectDraft(request))
+            if (quickSource) await recordRecentTarget(quickSource)
+          }
+        }}
         onConnectSaved={async (operationId, connectionId, temporarySecret, approval) => {
-          await startSavedSession(operationId, connectionId, temporarySecret, approval)
+          if (reconnectTarget) {
+            await reconnectSavedSession(
+              reconnectTarget.id,
+              operationId,
+              connectionId,
+              temporarySecret,
+              approval,
+              {
+                enabled: terminalSettings.keepaliveEnabled,
+                seconds: terminalSettings.keepaliveSeconds,
+              },
+            )
+          } else {
+            const profile = assets?.connections.find((candidate) => candidate.id === connectionId)
+            if (!profile) throw new Error('连接配置不存在，请刷新后重试')
+            await startSavedSession(
+              operationId,
+              connectionId,
+              temporarySecret,
+              approval,
+              toReconnectDraft(draftFromProfile(profile)),
+              {
+                enabled: terminalSettings.keepaliveEnabled,
+                seconds: terminalSettings.keepaliveSeconds,
+              },
+            )
+          }
           await refreshAssets()
         }}
       />
@@ -313,6 +370,7 @@ interface SessionWorkspaceProps {
   onNewConnection: () => void
   onActivateSession: (sessionId: string) => void
   onCloseSession: (sessionId: string) => Promise<void>
+  onReconnectSession: (sessionId: string) => void
   settings: TerminalSettings
 }
 
@@ -324,6 +382,7 @@ function SessionWorkspace({
   onNewConnection,
   onActivateSession,
   onCloseSession,
+  onReconnectSession,
   settings,
 }: SessionWorkspaceProps) {
   return (
@@ -386,6 +445,7 @@ function SessionWorkspace({
               session={session}
               active={session.id === activeSessionId}
               settings={settings}
+              onReconnect={() => onReconnectSession(session.id)}
             />
           ))
         )}
@@ -449,6 +509,8 @@ function SettingsView({ settings, onChange }: { settings: TerminalSettings; onCh
           <SettingControl label="光标闪烁" hint="应用到全部会话"><input type="checkbox" checked={settings.cursorBlink} onChange={(event) => update('cursorBlink', event.target.checked)} /></SettingControl>
           <SettingControl label="滚动缓冲" hint="1,000～100,000 行"><input type="number" min="1000" max="100000" step="1000" value={settings.scrollback} onChange={(event) => update('scrollback', Number(event.target.value))} /></SettingControl>
           <SettingControl label="关闭会话确认" hint="连接中的标签关闭前提示"><input type="checkbox" checked={settings.confirmCloseSession} onChange={(event) => update('confirmCloseSession', event.target.checked)} /></SettingControl>
+          <SettingControl label="SSH Keepalive" hint="新会话和手动重连时生效"><input type="checkbox" checked={settings.keepaliveEnabled} onChange={(event) => update('keepaliveEnabled', event.target.checked)} /></SettingControl>
+          <SettingControl label="Keepalive 间隔" hint="5～300 秒"><input type="number" min="5" max="300" disabled={!settings.keepaliveEnabled} value={settings.keepaliveSeconds} onChange={(event) => update('keepaliveSeconds', Number(event.target.value))} /></SettingControl>
         </div>
         <div className="architecture-note">
           <Icon name="server" />
@@ -479,5 +541,6 @@ function readTerminalSettings(): TerminalSettings {
     return normalizeTerminalSettings(null)
   }
 }
+
 
 export default App

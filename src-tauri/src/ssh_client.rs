@@ -78,7 +78,7 @@ pub async fn inspect_host_key(
     let handler = ProbeHandler {
         captured_key: Arc::clone(&captured_key),
     };
-    let config = Arc::new(client_config());
+    let config = Arc::new(client_config(None));
     let connection = tokio::time::timeout(
         timeout,
         client::connect(config, (host.to_owned(), port), handler),
@@ -149,9 +149,29 @@ pub async fn test_connection(
 
 pub async fn start_session(
     app: AppHandle,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+) -> Result<SessionState, AppError> {
+    start_session_with_id(app, request, approval, known_hosts_path, None).await
+}
+
+pub async fn reconnect_session(
+    app: AppHandle,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+    session_id: String,
+) -> Result<SessionState, AppError> {
+    start_session_with_id(app, request, approval, known_hosts_path, Some(session_id)).await
+}
+
+async fn start_session_with_id(
+    app: AppHandle,
     mut request: ConnectionRequest,
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
+    session_id: Option<String>,
 ) -> Result<SessionState, AppError> {
     request.validate().map_err(AppError::validation)?;
     let timeout = Duration::from_secs(request.timeout_seconds);
@@ -187,15 +207,17 @@ pub async fn start_session(
         .map_err(map_russh_error)?;
     channel.request_shell(true).await.map_err(map_russh_error)?;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let (commands_tx, commands_rx) = mpsc::channel(128);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     app.state::<SessionRegistry>()
-        .insert_ssh(session_id.clone(), commands_tx)?;
+        .insert_ssh(session_id.clone(), commands_tx, completion_rx)?;
 
     let task_app = app.clone();
     let task_session_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
         run_session(task_app, task_session_id, handle, channel, commands_rx).await;
+        let _ = completion_tx.send(());
     });
 
     Ok(SessionState {
@@ -215,7 +237,10 @@ async fn connect_authenticated(
         expected_fingerprint: expected_fingerprint.to_owned(),
         captured_key: Arc::clone(&captured_key),
     };
-    let config = Arc::new(client_config());
+    let keepalive = request
+        .keepalive_enabled
+        .then(|| Duration::from_secs(request.keepalive_seconds));
+    let config = Arc::new(client_config(keepalive));
     let mut handle = client::connect(config, (request.host.clone(), request.port), handler)
         .await
         .map_err(|error| {
@@ -401,10 +426,10 @@ fn emit_terminal_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Res
     .map_err(|error| AppError::event_delivery_failed(SESSION_OUTPUT_EVENT, error))
 }
 
-fn client_config() -> client::Config {
+fn client_config(keepalive_interval: Option<Duration>) -> client::Config {
     client::Config {
         nodelay: true,
-        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_interval,
         keepalive_max: 3,
         ..Default::default()
     }
@@ -656,6 +681,8 @@ mod tests {
             columns: 100,
             rows: 30,
             timeout_seconds: 5,
+            keepalive_enabled: true,
+            keepalive_seconds: 30,
         }
     }
 

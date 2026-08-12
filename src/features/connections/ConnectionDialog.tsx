@@ -31,6 +31,8 @@ interface ConnectionDialogProps {
   open: boolean
   initialDraft?: ConnectionDraft
   groups?: ConnectionGroup[]
+  reconnecting?: boolean
+  keepalive: { enabled: boolean; seconds: number }
   onClose: () => void
   onSave?: (request: ReturnType<typeof toSaveConnectionRequest>) => Promise<void>
   onConnect: (
@@ -52,6 +54,8 @@ export function ConnectionDialog({
   open: visible,
   initialDraft: suppliedDraft,
   groups = [],
+  reconnecting = false,
+  keepalive,
   onClose,
   onSave,
   onConnect,
@@ -103,7 +107,10 @@ export function ConnectionDialog({
     }
   }, [visible, suppliedDraft])
 
-  const normalizedRequest = useMemo(() => toConnectionRequest(draft), [draft])
+  const normalizedRequest = useMemo(
+    () => toConnectionRequest(draft, undefined, keepalive),
+    [draft, keepalive],
+  )
 
   if (!visible) return null
 
@@ -159,7 +166,7 @@ export function ConnectionDialog({
     try {
       if (selectedIntent === 'test') {
         const result = draft.id
-          ? await testSavedConnection(nextOperationId, draft.id, currentSecret(draft), approval)
+          ? await testSavedConnection(nextOperationId, draft.id, currentSecret(draft), approval, keepalive)
           : await testSshConnection(nextOperationId, normalizedRequest, approval)
         setTestResult(result.elapsedMillis)
         setProgress('')
@@ -234,8 +241,8 @@ export function ConnectionDialog({
       <section className="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-dialog-title">
         <header className="dialog-header">
           <div>
-            <span className="eyebrow">{draft.id ? 'EDIT CONNECTION' : 'NEW SSH SESSION'}</span>
-            <h2 id="connection-dialog-title">{draft.id ? '编辑连接' : '新建连接'}</h2>
+            <span className="eyebrow">{reconnecting ? 'RECONNECT SESSION' : draft.id ? 'EDIT CONNECTION' : 'NEW SSH SESSION'}</span>
+            <h2 id="connection-dialog-title">{reconnecting ? `重新连接 ${draft.name}` : draft.id ? '编辑连接' : '新建连接'}</h2>
             <p>普通数据只保存连接信息，秘密仅在授权时写入 Windows 凭据库。</p>
           </div>
           <button className="dialog-close" type="button" onClick={onClose} disabled={busy} aria-label="关闭"><Icon name="close" /></button>

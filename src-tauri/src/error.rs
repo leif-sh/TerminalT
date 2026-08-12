@@ -21,6 +21,16 @@ impl AppError {
         }
     }
 
+    pub fn session_already_active(session_id: &str) -> Self {
+        Self::new(
+            "SESSION-ALREADY-ACTIVE",
+            "session",
+            "该会话正在连接或已连接",
+            Some(format!("session id {session_id} is already registered")),
+            false,
+        )
+    }
+
     pub fn session_registry_unavailable() -> Self {
         Self {
             code: "SESSION-REGISTRY-UNAVAILABLE",

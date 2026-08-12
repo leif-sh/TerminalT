@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{self, Duration};
 
 use crate::error::AppError;
 
@@ -14,9 +15,11 @@ pub enum SessionCommand {
 enum SessionEntry {
     Mock {
         cancellation: oneshot::Sender<()>,
+        completion: oneshot::Receiver<()>,
     },
     Ssh {
         commands: mpsc::Sender<SessionCommand>,
+        completion: oneshot::Receiver<()>,
     },
 }
 
@@ -30,16 +33,30 @@ impl SessionRegistry {
         &self,
         session_id: String,
         cancellation: oneshot::Sender<()>,
+        completion: oneshot::Receiver<()>,
     ) -> Result<(), AppError> {
-        self.insert(session_id, SessionEntry::Mock { cancellation })
+        self.insert(
+            session_id,
+            SessionEntry::Mock {
+                cancellation,
+                completion,
+            },
+        )
     }
 
     pub fn insert_ssh(
         &self,
         session_id: String,
         commands: mpsc::Sender<SessionCommand>,
+        completion: oneshot::Receiver<()>,
     ) -> Result<(), AppError> {
-        self.insert(session_id, SessionEntry::Ssh { commands })
+        self.insert(
+            session_id,
+            SessionEntry::Ssh {
+                commands,
+                completion,
+            },
+        )
     }
 
     fn insert(&self, session_id: String, entry: SessionEntry) -> Result<(), AppError> {
@@ -47,6 +64,9 @@ impl SessionRegistry {
             .sessions
             .lock()
             .map_err(|_| AppError::session_registry_unavailable())?;
+        if sessions.contains_key(&session_id) {
+            return Err(AppError::session_already_active(&session_id));
+        }
         sessions.insert(session_id, entry);
         Ok(())
     }
@@ -68,7 +88,7 @@ impl SessionRegistry {
             .get(session_id)
             .ok_or_else(|| AppError::session_not_found(session_id))?;
         match entry {
-            SessionEntry::Ssh { commands } => commands
+            SessionEntry::Ssh { commands, .. } => commands
                 .try_send(command)
                 .map_err(|error| AppError::session_command_failed(error.to_string())),
             SessionEntry::Mock { .. } => Err(AppError::invalid_session_operation()),
@@ -83,7 +103,7 @@ impl SessionRegistry {
         let entry = sessions
             .get(session_id)
             .ok_or_else(|| AppError::session_not_found(session_id))?;
-        if let SessionEntry::Ssh { commands } = entry {
+        if let SessionEntry::Ssh { commands, .. } = entry {
             commands
                 .try_send(SessionCommand::Resize { columns, rows })
                 .map_err(|error| AppError::session_command_failed(error.to_string()))?;
@@ -100,10 +120,10 @@ impl SessionRegistry {
             .remove(session_id)
             .ok_or_else(|| AppError::session_not_found(session_id))?;
         match session {
-            SessionEntry::Mock { cancellation } => {
+            SessionEntry::Mock { cancellation, .. } => {
                 let _ = cancellation.send(());
             }
-            SessionEntry::Ssh { commands } => {
+            SessionEntry::Ssh { commands, .. } => {
                 let _ = commands.try_send(SessionCommand::Close);
             }
         }
@@ -118,22 +138,40 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub fn close_all(&self) -> Result<(), AppError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| AppError::session_registry_unavailable())?;
-        for (_, session) in sessions.drain() {
-            match session {
-                SessionEntry::Mock { cancellation } => {
-                    let _ = cancellation.send(());
-                }
-                SessionEntry::Ssh { commands } => {
-                    let _ = commands.try_send(SessionCommand::Close);
+    pub async fn close_all_bounded(&self, timeout: Duration) -> Result<bool, AppError> {
+        let completions = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| AppError::session_registry_unavailable())?;
+            let mut completions = Vec::with_capacity(sessions.len());
+            for (_, session) in sessions.drain() {
+                match session {
+                    SessionEntry::Mock {
+                        cancellation,
+                        completion,
+                    } => {
+                        let _ = cancellation.send(());
+                        completions.push(completion);
+                    }
+                    SessionEntry::Ssh {
+                        commands,
+                        completion,
+                    } => {
+                        let _ = commands.try_send(SessionCommand::Close);
+                        completions.push(completion);
+                    }
                 }
             }
-        }
-        Ok(())
+            completions
+        };
+        Ok(time::timeout(timeout, async move {
+            for completion in completions {
+                let _ = completion.await;
+            }
+        })
+        .await
+        .is_ok())
     }
 
     #[cfg(test)]
@@ -194,14 +232,15 @@ impl OperationRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationRegistry, SessionRegistry};
+    use super::{Duration, OperationRegistry, SessionRegistry};
 
     #[test]
     fn mock_session_lifecycle_removes_entries() {
         let registry = SessionRegistry::default();
         let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let (_completion, completion_receiver) = tokio::sync::oneshot::channel();
         registry
-            .insert_mock("session-1".to_owned(), sender)
+            .insert_mock("session-1".to_owned(), sender, completion_receiver)
             .unwrap();
         assert!(registry.contains("session-1").unwrap());
 
@@ -209,18 +248,62 @@ mod tests {
         assert_eq!(registry.size().unwrap(), 0);
     }
 
-    #[test]
-    fn close_all_clears_every_session() {
+    #[tokio::test]
+    async fn close_all_clears_every_session() {
         let registry = SessionRegistry::default();
+        let mut completions = Vec::new();
         for index in 0..3 {
             let (sender, _receiver) = tokio::sync::oneshot::channel();
+            let (completion, completion_receiver) = tokio::sync::oneshot::channel();
             registry
-                .insert_mock(format!("session-{index}"), sender)
+                .insert_mock(format!("session-{index}"), sender, completion_receiver)
                 .unwrap();
+            completions.push(completion);
         }
 
-        registry.close_all().unwrap();
+        for completion in completions {
+            completion.send(()).unwrap();
+        }
+        assert!(registry
+            .close_all_bounded(Duration::from_secs(1))
+            .await
+            .unwrap());
         assert_eq!(registry.size().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn close_all_stops_waiting_at_the_deadline() {
+        let registry = SessionRegistry::default();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let (_completion, completion_receiver) = tokio::sync::oneshot::channel::<()>();
+        registry
+            .insert_mock("session-1".to_owned(), sender, completion_receiver)
+            .unwrap();
+
+        assert!(!registry
+            .close_all_bounded(Duration::from_millis(10))
+            .await
+            .unwrap());
+        assert_eq!(registry.size().unwrap(), 0);
+    }
+
+    #[test]
+    fn duplicate_session_id_is_rejected() {
+        let registry = SessionRegistry::default();
+        let (first, _receiver) = tokio::sync::oneshot::channel();
+        let (second, _receiver) = tokio::sync::oneshot::channel();
+        let (_first_completion, first_receiver) = tokio::sync::oneshot::channel();
+        let (_second_completion, second_receiver) = tokio::sync::oneshot::channel();
+        registry
+            .insert_mock("session-1".to_owned(), first, first_receiver)
+            .unwrap();
+
+        let error = registry
+            .insert_mock("session-1".to_owned(), second, second_receiver)
+            .unwrap_err();
+
+        assert_eq!(error.code, "SESSION-ALREADY-ACTIVE");
+        assert_eq!(registry.size().unwrap(), 1);
     }
 
     #[test]

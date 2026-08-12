@@ -6,11 +6,24 @@ import {
   connectSsh,
   listenToSessionStatus,
   normalizeCommandError,
+  reconnectSavedConnection,
+  reconnectSsh,
+  type KeepaliveOptions,
 } from '../../lib/ipc'
-import type { ConnectionRequest, HostKeyApproval } from '../../domain/connection/types'
+import type { ConnectionDraft, ConnectionRequest, HostKeyApproval } from '../../domain/connection/types'
+
+export type SessionReconnectSource =
+  | { kind: 'saved'; connectionId: string; draft: ConnectionDraft }
+  | { kind: 'request'; draft: ConnectionDraft }
+
+export interface ManagedSession extends SessionState {
+  reconnectSource: SessionReconnectSource
+  reconnectGeneration: number
+  reconnecting: boolean
+}
 
 interface SessionControllerState {
-  sessions: SessionState[]
+  sessions: ManagedSession[]
   activeSessionId?: string
   pending: boolean
   error?: string
@@ -18,18 +31,21 @@ interface SessionControllerState {
 
 type SessionAction =
   | { type: 'create-started' }
-  | { type: 'created'; session: SessionState }
+  | { type: 'created'; session: ManagedSession }
   | { type: 'create-failed'; message: string }
   | { type: 'status-changed'; payload: SessionStatusPayload }
   | { type: 'activated'; sessionId: string }
   | { type: 'closed'; sessionId: string }
+  | { type: 'reconnect-started'; sessionId: string }
+  | { type: 'reconnected'; sessionId: string; session: SessionState }
+  | { type: 'reconnect-failed'; sessionId: string; message: string }
 
-const initialState: SessionControllerState = {
+export const initialSessionControllerState: SessionControllerState = {
   sessions: [],
   pending: false,
 }
 
-function sessionReducer(
+export function sessionReducer(
   state: SessionControllerState,
   action: SessionAction,
 ): SessionControllerState {
@@ -75,11 +91,48 @@ function sessionReducer(
             : state.activeSessionId,
       }
     }
+    case 'reconnect-started':
+      return {
+        ...state,
+        error: undefined,
+        sessions: state.sessions.map((session) => session.id === action.sessionId
+          ? {
+              ...session,
+              status: 'connecting',
+              lastError: undefined,
+              reconnecting: true,
+              reconnectGeneration: session.reconnectGeneration + 1,
+            }
+          : session),
+      }
+    case 'reconnected':
+      return {
+        ...state,
+        sessions: state.sessions.map((session) => session.id === action.sessionId
+          ? {
+              ...session,
+              ...action.session,
+              id: action.sessionId,
+              reconnectSource: session.reconnectSource,
+              reconnectGeneration: session.reconnectGeneration,
+              reconnecting: false,
+              lastError: undefined,
+              disconnectReason: undefined,
+            }
+          : session),
+      }
+    case 'reconnect-failed':
+      return {
+        ...state,
+        sessions: state.sessions.map((session) => session.id === action.sessionId
+          ? { ...session, status: 'failed', reconnecting: false, lastError: action.message }
+          : session),
+      }
   }
 }
 
 export function useSessionController() {
-  const [state, dispatch] = useReducer(sessionReducer, initialState)
+  const [state, dispatch] = useReducer(sessionReducer, initialSessionControllerState)
 
   useEffect(() => {
     let disposed = false
@@ -102,11 +155,27 @@ export function useSessionController() {
     connectionId: string,
     temporarySecret: string | undefined,
     approval: HostKeyApproval,
+    reconnectDraft: ConnectionDraft,
+    keepalive: KeepaliveOptions,
   ) => {
     dispatch({ type: 'create-started' })
     try {
-      const session = await connectSavedConnection(operationId, connectionId, temporarySecret, approval)
-      dispatch({ type: 'created', session })
+      const session = await connectSavedConnection(
+        operationId,
+        connectionId,
+        temporarySecret,
+        approval,
+        keepalive,
+      )
+      dispatch({
+        type: 'created',
+        session: {
+          ...session,
+          reconnectSource: { kind: 'saved', connectionId, draft: reconnectDraft },
+          reconnectGeneration: 0,
+          reconnecting: false,
+        },
+      })
     } catch (error) {
       dispatch({ type: 'create-failed', message: normalizeCommandError(error).message })
       throw error
@@ -117,11 +186,20 @@ export function useSessionController() {
     operationId: string,
     request: ConnectionRequest,
     approval: HostKeyApproval,
+    reconnectDraft: ConnectionDraft,
   ) => {
     dispatch({ type: 'create-started' })
     try {
       const session = await connectSsh(operationId, request, approval)
-      dispatch({ type: 'created', session })
+      dispatch({
+        type: 'created',
+        session: {
+          ...session,
+          reconnectSource: { kind: 'request', draft: reconnectDraft },
+          reconnectGeneration: 0,
+          reconnecting: false,
+        },
+      })
     } catch (error) {
       dispatch({ type: 'create-failed', message: normalizeCommandError(error).message })
       throw error
@@ -137,5 +215,54 @@ export function useSessionController() {
     dispatch({ type: 'activated', sessionId })
   }, [])
 
-  return { ...state, startSession, startSavedSession, closeSession, activateSession }
+  const reconnectSession = useCallback(async (
+    sessionId: string,
+    operationId: string,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+  ) => {
+    dispatch({ type: 'reconnect-started', sessionId })
+    try {
+      const session = await reconnectSsh(operationId, sessionId, request, approval)
+      dispatch({ type: 'reconnected', sessionId, session })
+    } catch (error) {
+      dispatch({ type: 'reconnect-failed', sessionId, message: normalizeCommandError(error).message })
+      throw error
+    }
+  }, [])
+
+  const reconnectSavedSession = useCallback(async (
+    sessionId: string,
+    operationId: string,
+    connectionId: string,
+    temporarySecret: string | undefined,
+    approval: HostKeyApproval,
+    keepalive: KeepaliveOptions,
+  ) => {
+    dispatch({ type: 'reconnect-started', sessionId })
+    try {
+      const session = await reconnectSavedConnection(
+        operationId,
+        sessionId,
+        connectionId,
+        temporarySecret,
+        approval,
+        keepalive,
+      )
+      dispatch({ type: 'reconnected', sessionId, session })
+    } catch (error) {
+      dispatch({ type: 'reconnect-failed', sessionId, message: normalizeCommandError(error).message })
+      throw error
+    }
+  }, [])
+
+  return {
+    ...state,
+    startSession,
+    startSavedSession,
+    reconnectSession,
+    reconnectSavedSession,
+    closeSession,
+    activateSession,
+  }
 }

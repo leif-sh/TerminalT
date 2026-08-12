@@ -57,6 +57,10 @@ pub struct ConnectionRequest {
     pub columns: u16,
     pub rows: u16,
     pub timeout_seconds: u64,
+    #[serde(default = "default_keepalive_enabled")]
+    pub keepalive_enabled: bool,
+    #[serde(default = "default_keepalive_seconds")]
+    pub keepalive_seconds: u64,
 }
 
 impl ConnectionRequest {
@@ -79,6 +83,9 @@ impl ConnectionRequest {
         if self.columns == 0 || self.rows == 0 {
             return Err("终端尺寸必须大于 0");
         }
+        if self.keepalive_enabled && !(5..=300).contains(&self.keepalive_seconds) {
+            return Err("SSH keepalive 间隔必须为 5～300 秒");
+        }
         match self.auth_type {
             AuthType::Password if self.password.as_deref().unwrap_or_default().is_empty() => {
                 Err("请输入密码")
@@ -95,6 +102,14 @@ impl ConnectionRequest {
             _ => Ok(()),
         }
     }
+}
+
+fn default_keepalive_enabled() -> bool {
+    true
+}
+
+fn default_keepalive_seconds() -> u64 {
+    30
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -199,6 +214,32 @@ pub struct HostKeyApproval {
     pub action: HostKeyAction,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepaliveSettings {
+    pub enabled: bool,
+    pub seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSessionRequest {
+    pub connection_id: String,
+    pub temporary_secret: Option<String>,
+    pub approval: HostKeyApproval,
+    pub keepalive: Option<KeepaliveSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectSavedSessionRequest {
+    pub session_id: String,
+    pub connection_id: String,
+    pub temporary_secret: Option<String>,
+    pub approval: HostKeyApproval,
+    pub keepalive: Option<KeepaliveSettings>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum HostKeyAction {
@@ -220,4 +261,42 @@ pub struct ConnectionProgressPayload {
     pub operation_id: String,
     pub status: SessionStatus,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthType, ConnectionRequest};
+
+    fn request() -> ConnectionRequest {
+        ConnectionRequest {
+            name: "test".to_owned(),
+            host: "example.com".to_owned(),
+            port: 22,
+            username: "user".to_owned(),
+            auth_type: AuthType::Password,
+            password: Some("secret".to_owned()),
+            private_key_path: None,
+            private_key_passphrase: None,
+            columns: 80,
+            rows: 24,
+            timeout_seconds: 15,
+            keepalive_enabled: true,
+            keepalive_seconds: 30,
+        }
+    }
+
+    #[test]
+    fn keepalive_interval_is_validated_only_when_enabled() {
+        let mut enabled = request();
+        enabled.keepalive_seconds = 4;
+        assert_eq!(
+            enabled.validate(),
+            Err("SSH keepalive 间隔必须为 5～300 秒")
+        );
+
+        let mut disabled = request();
+        disabled.keepalive_enabled = false;
+        disabled.keepalive_seconds = 0;
+        assert!(disabled.validate().is_ok());
+    }
 }

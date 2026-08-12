@@ -11,8 +11,8 @@ use error::AppError;
 use models::{
     ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile, ConnectionProgressPayload,
     ConnectionRequest, ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval,
-    HostKeyInspection, SaveConnectionRequest, SessionOutputPayload, SessionState, SessionStatus,
-    SessionStatusPayload,
+    HostKeyInspection, KeepaliveSettings, ReconnectSavedSessionRequest, SaveConnectionRequest,
+    SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -111,12 +111,14 @@ fn create_mock_session(
     let session_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
     let (cancellation, cancellation_receiver) = oneshot::channel();
-    registry.insert_mock(session_id.clone(), cancellation)?;
+    let (completion, completion_receiver) = oneshot::channel();
+    registry.insert_mock(session_id.clone(), cancellation, completion_receiver)?;
 
     let task_session_id = session_id.clone();
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_mock_session(task_app, task_session_id, cancellation_receiver).await;
+        let _ = completion.send(());
     });
 
     Ok(SessionState {
@@ -343,12 +345,12 @@ async fn test_saved_connection(
     operations: State<'_, OperationRegistry>,
     store: State<'_, assets::AssetStore>,
     operation_id: String,
-    connection_id: String,
-    temporary_secret: Option<String>,
-    approval: HostKeyApproval,
+    request: SavedSessionRequest,
 ) -> Result<ConnectionTestResult, AppError> {
-    let request = store.connection_request(&connection_id, temporary_secret)?;
-    test_ssh_connection(app, operations, operation_id, request, approval).await
+    let mut connection =
+        store.connection_request(&request.connection_id, request.temporary_secret)?;
+    apply_keepalive(&mut connection, request.keepalive);
+    test_ssh_connection(app, operations, operation_id, connection, request.approval).await
 }
 
 #[tauri::command]
@@ -357,16 +359,92 @@ async fn connect_saved_connection(
     operations: State<'_, OperationRegistry>,
     store: State<'_, assets::AssetStore>,
     operation_id: String,
-    connection_id: String,
-    temporary_secret: Option<String>,
-    approval: HostKeyApproval,
+    request: SavedSessionRequest,
 ) -> Result<SessionState, AppError> {
-    let request = store.connection_request(&connection_id, temporary_secret)?;
-    let session = connect_ssh(app, operations, operation_id, request, approval).await?;
-    if let Err(error) = store.mark_connected(&connection_id) {
+    let mut connection =
+        store.connection_request(&request.connection_id, request.temporary_secret)?;
+    apply_keepalive(&mut connection, request.keepalive);
+    let session = connect_ssh(app, operations, operation_id, connection, request.approval).await?;
+    if let Err(error) = store.mark_connected(&request.connection_id) {
         log::warn!("failed to update last-connected timestamp: {}", error.code);
     }
     Ok(session)
+}
+
+#[tauri::command]
+async fn reconnect_ssh(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    session_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+) -> Result<SessionState, AppError> {
+    let setup_timeout = time::Duration::from_secs(request.timeout_seconds);
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::Connecting,
+        "正在建立新的 SSH 会话",
+    );
+    let cancellation = operations.register(operation_id.clone())?;
+    let known_hosts_path = known_hosts_path(&app)?;
+    let result = tokio::select! {
+        result = time::timeout(
+            setup_timeout,
+            ssh_client::reconnect_session(
+                app.clone(),
+                request,
+                approval,
+                known_hosts_path,
+                session_id,
+            ),
+        ) => result.map_err(|_| AppError::ssh(
+            "CONNECTION-TIMEOUT",
+            "重新连接超时，请检查网络和服务器状态",
+            "SSH reconnect setup exceeded the configured timeout",
+            true,
+        ))?,
+        _ = cancellation => Err(AppError::cancelled()),
+    };
+    operations.finish(&operation_id)?;
+    if result.is_err() {
+        emit_progress(&app, &operation_id, SessionStatus::Failed, "重新连接失败");
+    }
+    result
+}
+
+#[tauri::command]
+async fn reconnect_saved_connection(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    store: State<'_, assets::AssetStore>,
+    operation_id: String,
+    request: ReconnectSavedSessionRequest,
+) -> Result<SessionState, AppError> {
+    let mut connection =
+        store.connection_request(&request.connection_id, request.temporary_secret)?;
+    apply_keepalive(&mut connection, request.keepalive);
+    let session = reconnect_ssh(
+        app,
+        operations,
+        operation_id,
+        request.session_id,
+        connection,
+        request.approval,
+    )
+    .await?;
+    if let Err(error) = store.mark_connected(&request.connection_id) {
+        log::warn!("failed to update last-connected timestamp: {}", error.code);
+    }
+    Ok(session)
+}
+
+fn apply_keepalive(request: &mut ConnectionRequest, settings: Option<KeepaliveSettings>) {
+    if let Some(settings) = settings {
+        request.keepalive_enabled = settings.enabled;
+        request.keepalive_seconds = settings.seconds;
+    }
 }
 
 #[tauri::command]
@@ -451,6 +529,8 @@ pub fn run() {
             connect_ssh,
             test_saved_connection,
             connect_saved_connection,
+            reconnect_ssh,
+            reconnect_saved_connection,
             cancel_operation,
         ])
         .build(tauri::generate_context!())
@@ -458,8 +538,14 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            if let Err(error) = app_handle.state::<SessionRegistry>().close_all() {
-                log::error!("{}: {}", error.code, error.message);
+            match tauri::async_runtime::block_on(
+                app_handle
+                    .state::<SessionRegistry>()
+                    .close_all_bounded(time::Duration::from_secs(2)),
+            ) {
+                Ok(true) => {}
+                Ok(false) => log::warn!("session shutdown exceeded the 2 second deadline"),
+                Err(error) => log::error!("{}: {}", error.code, error.message),
             }
             if let Err(error) = app_handle.state::<OperationRegistry>().cancel_all() {
                 log::error!("{}: {}", error.code, error.message);

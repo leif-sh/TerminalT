@@ -28,6 +28,8 @@ export interface ConnectionRequest extends TerminalSize {
   privateKeyPath: string
   privateKeyPassphrase: string
   timeoutSeconds: number
+  keepaliveEnabled: boolean
+  keepaliveSeconds: number
 }
 
 export interface ConnectionGroup {
@@ -163,6 +165,7 @@ export function validateConnectionDraft(draft: ConnectionDraft, hasStoredCredent
 export function toConnectionRequest(
   draft: ConnectionDraft,
   size: TerminalSize = { columns: 80, rows: 24 },
+  keepalive = { enabled: true, seconds: 30 },
 ): ConnectionRequest {
   return {
     name: draft.name.trim() || draft.host.trim(),
@@ -174,6 +177,8 @@ export function toConnectionRequest(
     privateKeyPath: draft.privateKeyPath,
     privateKeyPassphrase: draft.privateKeyPassphrase,
     timeoutSeconds: draft.timeoutSeconds,
+    keepaliveEnabled: keepalive.enabled,
+    keepaliveSeconds: keepalive.seconds,
     ...size,
   }
 }
@@ -209,6 +214,16 @@ export function toSaveConnectionRequest(draft: ConnectionDraft): SaveConnectionR
     groupId: draft.groupId,
     note: draft.note.trim() || undefined,
     timeoutSeconds: draft.timeoutSeconds,
+  }
+}
+
+export function toReconnectDraft(source: ConnectionDraft | ConnectionRequest): ConnectionDraft {
+  return {
+    ...initialConnectionDraft,
+    ...source,
+    password: '',
+    privateKeyPassphrase: '',
+    rememberCredential: 'rememberCredential' in source ? source.rememberCredential : false,
   }
 }
 
