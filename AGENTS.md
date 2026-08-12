@@ -8,7 +8,7 @@
 
 ## Rust 后端开发规范
 
-- 所有新增或修改的 Rust 后端代码，包括 `src-tauri`、`src-service` 和 `crates/tun-protocol`，必须遵循 `docs/rust-backend-development-guidelines.md`。
+- 所有新增或修改的 Rust 后端代码，包括 `src-tauri`，必须遵循 `docs/rust-backend-development-guidelines.md`。
 - 开始 Rust 后端工作前必须完整阅读该规范，并按其中的架构边界、安全、恢复、测试、版本和代码审查要求执行；项目级 skill 入口为 `.agents/skills/rust-backend-development/SKILL.md`。
 
 ## 自动提交
@@ -29,6 +29,5 @@
 - 每个已完成并通过验证的新功能或 bug 修复都必须在同一需求内自动递增一次应用版本；一个需求同时包含多个功能或修复时仍只递增一次。
 - 版本必须保持 `MAJOR.MINOR.PATCH-N` 格式，常规功能和修复只将末尾数字 `N` 加一，例如 `0.1.0-1` 递增为 `0.1.0-2`。版本文件中不要添加 `v` 前缀；`v` 仅用于 Git 发布标签。
 - 同步更新应用声明与锁文件：`package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json`；使用 npm/Cargo 命令刷新锁文件，不要手工修改锁文件中的依赖版本。
-- TUN 服务版本必须与应用版本严格一致：同步更新 `src-service/Cargo.toml`、`src-service/Cargo.lock` 和 `src-tauri/binaries/manifest.json` 的 `tun.serviceVersion`；重新构建并审核锁定的服务二进制后，同步其大小和 SHA-256，不得伪造或跳过资产校验。
-- 递增后至少运行 `npm run release:version`、`npm run release:test` 和 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tun/prepare-assets.ps1 -ValidateLockedAssetsOnly`，再运行与本次功能或修复相关的验证。
+- 递增后至少运行 `npm run release:version` 和 `npm run release:test`，再运行与本次功能或修复相关的验证。
 - 纯文档、测试、重构、样式、构建或工具链调整不自动递增版本；未完成、未通过验证或用户明确要求不改版本时也不递增。
