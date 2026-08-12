@@ -1,0 +1,34 @@
+# 仓库工作流程
+
+## 前端设计规范
+
+- 所有新增或修改的前端页面、组件、样式及数据可视化，必须遵循 `design/FRONTEND_DESIGN_PROMPT.md`。
+- `design/clashT主界面设计风格.png` 是视觉基准；提示词与参考图冲突时，以参考图呈现的视觉语言为准。
+- 开始前端工作前先阅读完整设计提示词，完成后按其中的自检清单核对；不要引入与其冲突的通用后台模板风格。
+
+## Rust 后端开发规范
+
+- 所有新增或修改的 Rust 后端代码，包括 `src-tauri`、`src-service` 和 `crates/tun-protocol`，必须遵循 `docs/rust-backend-development-guidelines.md`。
+- 开始 Rust 后端工作前必须完整阅读该规范，并按其中的架构边界、安全、恢复、测试、版本和代码审查要求执行；项目级 skill 入口为 `.agents/skills/rust-backend-development/SKILL.md`。
+
+## 自动提交
+
+- 当提交包含程序源码、测试代码或构建与自动化脚本修改时，提交前必须读取并执行 `.agents/skills/pre-commit-ci/SKILL.md`；只有完整的本地 CI 等价校验通过后才能创建提交。
+- 仅修改文档、图片、设计资源、普通文本、skill 或流程规范等非代码文件时，不触发 `pre-commit-ci`。
+- 触发 CI 校验后，失败时不得绕过、忽略或使用失败的提交；必须定位并自动修复导致 CI 失败的根因，重跑失败步骤后再重跑完整校验。
+- 完成并验证用户要求的代码、配置或文档修改后，自动为已完成的需求创建 Git 提交。
+- 只暂存属于当前需求的文件。保留并排除与当前需求无关的既有修改，除非用户明确要求提交当前全部修改。
+- 使用简洁的 Conventional Commits 格式提交信息来描述本次需求。
+- 除非用户明确要求，否则不要修改已有提交。
+- 除非用户明确要求，否则不要推送提交或创建拉取请求。
+- 如果用户明确要求当前修改不要提交，则当前需求遵循该指示。
+- 如果无法完成验证或实现仍未完成，应报告阻塞原因，不要创建具有误导性的完成提交。
+
+## 自动版本递增
+
+- 每个已完成并通过验证的新功能或 bug 修复都必须在同一需求内自动递增一次应用版本；一个需求同时包含多个功能或修复时仍只递增一次。
+- 版本必须保持 `MAJOR.MINOR.PATCH-N` 格式，常规功能和修复只将末尾数字 `N` 加一，例如 `0.1.0-1` 递增为 `0.1.0-2`。版本文件中不要添加 `v` 前缀；`v` 仅用于 Git 发布标签。
+- 同步更新应用声明与锁文件：`package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json`；使用 npm/Cargo 命令刷新锁文件，不要手工修改锁文件中的依赖版本。
+- TUN 服务版本必须与应用版本严格一致：同步更新 `src-service/Cargo.toml`、`src-service/Cargo.lock` 和 `src-tauri/binaries/manifest.json` 的 `tun.serviceVersion`；重新构建并审核锁定的服务二进制后，同步其大小和 SHA-256，不得伪造或跳过资产校验。
+- 递增后至少运行 `npm run release:version`、`npm run release:test` 和 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tun/prepare-assets.ps1 -ValidateLockedAssetsOnly`，再运行与本次功能或修复相关的验证。
+- 纯文档、测试、重构、样式、构建或工具链调整不自动递增版本；未完成、未通过验证或用户明确要求不改版本时也不递增。
