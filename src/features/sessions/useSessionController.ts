@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer } from 'react'
 import type { SessionState, SessionStatusPayload } from '../../domain/session/types'
 import {
   closeSession as closeRuntimeSession,
+  connectSavedConnection,
   connectSsh,
   listenToSessionStatus,
   normalizeCommandError,
@@ -93,6 +94,22 @@ export function useSessionController() {
     }
   }, [])
 
+  const startSavedSession = useCallback(async (
+    operationId: string,
+    connectionId: string,
+    temporarySecret: string | undefined,
+    approval: HostKeyApproval,
+  ) => {
+    dispatch({ type: 'create-started' })
+    try {
+      const session = await connectSavedConnection(operationId, connectionId, temporarySecret, approval)
+      dispatch({ type: 'created', session })
+    } catch (error) {
+      dispatch({ type: 'create-failed', message: normalizeCommandError(error).message })
+      throw error
+    }
+  }, [])
+
   const startSession = useCallback(async (
     operationId: string,
     request: ConnectionRequest,
@@ -117,5 +134,5 @@ export function useSessionController() {
     dispatch({ type: 'activated', sessionId })
   }, [])
 
-  return { ...state, startSession, closeSession, activateSession }
+  return { ...state, startSession, startSavedSession, closeSession, activateSession }
 }

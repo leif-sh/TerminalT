@@ -4,6 +4,7 @@ use russh::keys::{ssh_key, HashAlg};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    assets::atomic_write,
     error::AppError,
     models::{HostKeyAction, HostKeyInspection, HostKeyStatus},
 };
@@ -27,13 +28,13 @@ impl HostKeyIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HostKeyRecord {
-    host: String,
-    port: u16,
-    algorithm: String,
-    fingerprint_sha256: String,
-    public_key: String,
-    trusted_at: String,
+pub struct HostKeyRecord {
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint_sha256: String,
+    pub public_key: String,
+    pub trusted_at: String,
 }
 
 pub struct KnownHostsStore {
@@ -43,6 +44,16 @@ pub struct KnownHostsStore {
 impl KnownHostsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    pub fn list(&self) -> Result<Vec<HostKeyRecord>, AppError> {
+        self.read_records()
+    }
+
+    pub fn delete(&self, host: &str, port: u16) -> Result<(), AppError> {
+        let mut records = self.read_records()?;
+        records.retain(|record| !(record.host == host && record.port == port));
+        self.write_records(&records)
     }
 
     pub fn inspect(
@@ -127,15 +138,9 @@ impl KnownHostsStore {
     }
 
     fn write_records(&self, records: &[HostKeyRecord]) -> Result<(), AppError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                AppError::storage("无法创建服务器指纹存储目录", error.to_string())
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(records)
             .map_err(|error| AppError::storage("无法序列化服务器指纹记录", error.to_string()))?;
-        fs::write(&self.path, bytes)
-            .map_err(|error| AppError::storage("无法保存服务器指纹", error.to_string()))
+        atomic_write(&self.path, &bytes)
     }
 }
 
@@ -190,5 +195,8 @@ mod tests {
         assert!(store
             .approve("host", 22, &second, HostKeyAction::TrustNew)
             .is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
+        store.delete("host", 22).unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 }

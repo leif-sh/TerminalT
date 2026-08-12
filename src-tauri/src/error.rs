@@ -98,6 +98,35 @@ impl AppError {
         )
     }
 
+    pub fn asset_storage(message: impl Into<String>, details: impl Into<String>) -> Self {
+        Self::new(
+            "ASSET-STORAGE-FAILED",
+            "storage",
+            message,
+            Some(details.into()),
+            true,
+        )
+    }
+
+    pub fn credential(
+        code: &'static str,
+        message: impl Into<String>,
+        details: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self::new(code, "credential", message, Some(details.into()), retryable)
+    }
+
+    pub fn asset_not_found(kind: &'static str, id: &str) -> Self {
+        Self::new(
+            "ASSET-NOT-FOUND",
+            "storage",
+            "连接或分组不存在",
+            Some(format!("{kind} id {id} was not found")),
+            false,
+        )
+    }
+
     fn new(
         code: &'static str,
         category: &'static str,

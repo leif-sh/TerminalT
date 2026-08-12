@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -43,7 +43,7 @@ pub struct SessionStatusPayload {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionRequest {
     pub name: String,
@@ -97,11 +97,80 @@ impl ConnectionRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthType {
     Password,
     PrivateKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionGroup {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_type: AuthType,
+    pub credential_ref: Option<String>,
+    pub private_key_path: Option<String>,
+    pub group_id: String,
+    pub note: Option<String>,
+    pub timeout_seconds: u64,
+    pub last_connected_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveConnectionRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_type: AuthType,
+    pub secret: Option<String>,
+    pub remember_credential: bool,
+    pub private_key_path: Option<String>,
+    pub group_id: String,
+    pub note: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentTarget {
+    pub display_target: String,
+    pub last_used_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionAssetSnapshot {
+    pub schema_version: u16,
+    pub default_group_id: String,
+    pub groups: Vec<ConnectionGroup>,
+    pub connections: Vec<ConnectionProfile>,
+    pub recent_targets: Vec<RecentTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupNameRequest {
+    pub id: Option<String>,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

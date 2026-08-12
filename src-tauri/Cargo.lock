@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "terminalt"
-version = "0.1.0-2"
+version = "0.1.0-3"
 dependencies = [
  "chrono",
  "log",
@@ -4586,6 +4586,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -4,8 +4,13 @@ import { Icon } from './components/Icon'
 import { TerminalView } from './features/terminal/TerminalView'
 import { useSessionController } from './features/sessions/useSessionController'
 import { ConnectionDialog } from './features/connections/ConnectionDialog'
-import type { ConnectionRequest, HostKeyApproval } from './domain/connection/types'
-import { healthCheck, normalizeCommandError, type HealthResponse } from './lib/ipc'
+import type { ConnectionAssetSnapshot, ConnectionDraft, ConnectionProfile, ConnectionRequest, HostKeyApproval, SaveConnectionRequest } from './domain/connection/types'
+import { draftFromProfile, filterConnections, initialConnectionDraft, parseQuickTarget } from './domain/connection/types'
+import {
+  copyConnectionProfile, deleteConnectionGroup, deleteConnectionProfile, healthCheck,
+  listConnectionAssets, normalizeCommandError, recordRecentTarget, saveConnectionGroup,
+  saveConnectionProfile, type HealthResponse,
+} from './lib/ipc'
 import { t } from './lib/i18n'
 
 type View = 'connections' | 'settings'
@@ -15,14 +20,36 @@ function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string>()
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false)
+  const [dialogDraft, setDialogDraft] = useState<ConnectionDraft>()
+  const [quickSource, setQuickSource] = useState<string>()
+  const [assets, setAssets] = useState<ConnectionAssetSnapshot>()
+  const [assetError, setAssetError] = useState<string>()
   const {
     sessions,
     activeSessionId,
     error,
     startSession,
+    startSavedSession,
     closeSession,
     activateSession,
   } = useSessionController()
+
+  const refreshAssets = async () => {
+    try {
+      setAssets(await listConnectionAssets())
+      setAssetError(undefined)
+    } catch (cause) {
+      setAssetError(normalizeCommandError(cause).message)
+    }
+  }
+  const runAssetAction = async (action: () => Promise<unknown>) => {
+    try {
+      await action()
+      await refreshAssets()
+    } catch (cause) {
+      setAssetError(normalizeCommandError(cause).message)
+    }
+  }
 
   useEffect(() => {
     let disposed = false
@@ -37,6 +64,8 @@ function App() {
       disposed = true
     }
   }, [])
+
+  useEffect(() => { void refreshAssets() }, [])
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
 
@@ -86,14 +115,32 @@ function App() {
           <>
             <ConnectionsPanel
               hasSession={sessions.length > 0}
-              onNewConnection={() => setConnectionDialogOpen(true)}
+              assets={assets}
+              activeSessionTitles={new Set(sessions.map((session) => session.title))}
+              error={assetError}
+              onNewConnection={() => { setQuickSource(undefined); setDialogDraft(undefined); setConnectionDialogOpen(true) }}
+              onOpenConnection={(profile) => { setQuickSource(undefined); setDialogDraft(draftFromProfile(profile)); setConnectionDialogOpen(true) }}
+              onQuickConnection={(draft, source) => { setQuickSource(source); setDialogDraft(draft); setConnectionDialogOpen(true) }}
+              onCopy={(id) => runAssetAction(() => copyConnectionProfile(id))}
+              onDelete={async (profile) => {
+                if (window.confirm(`删除连接“${profile.name}”？已建立的会话不会关闭，私钥文件不会被删除。`)) {
+                  await runAssetAction(() => deleteConnectionProfile(profile.id))
+                }
+              }}
+              onCreateGroup={(name) => runAssetAction(() => saveConnectionGroup(name))}
+              onRenameGroup={(id, name) => runAssetAction(() => saveConnectionGroup(name, id))}
+              onDeleteGroup={async (id, name) => {
+                if (window.confirm(`删除分组“${name}”？其中连接将移入默认分组。`)) {
+                  await runAssetAction(() => deleteConnectionGroup(id))
+                }
+              }}
             />
             <SessionWorkspace
               sessions={sessions}
               activeSessionId={activeSessionId}
               activeSessionTitle={activeSession?.title}
               error={error}
-              onNewConnection={() => setConnectionDialogOpen(true)}
+              onNewConnection={() => { setQuickSource(undefined); setDialogDraft(undefined); setConnectionDialogOpen(true) }}
               onActivateSession={activateSession}
               onCloseSession={closeSession}
             />
@@ -104,12 +151,19 @@ function App() {
       </section>
       <ConnectionDialog
         open={connectionDialogOpen}
-        onClose={() => setConnectionDialogOpen(false)}
+        initialDraft={dialogDraft}
+        groups={assets?.groups}
+        onClose={() => { setConnectionDialogOpen(false); setDialogDraft(undefined); setQuickSource(undefined) }}
+        onSave={quickSource ? undefined : async (request: SaveConnectionRequest) => { await saveConnectionProfile(request); await refreshAssets() }}
         onConnect={async (
           operationId: string,
           request: ConnectionRequest,
           approval: HostKeyApproval,
-        ) => startSession(operationId, request, approval)}
+        ) => { await startSession(operationId, request, approval); if (quickSource) await recordRecentTarget(quickSource) }}
+        onConnectSaved={async (operationId, connectionId, temporarySecret, approval) => {
+          await startSavedSession(operationId, connectionId, temporarySecret, approval)
+          await refreshAssets()
+        }}
       />
     </main>
   )
@@ -117,10 +171,35 @@ function App() {
 
 interface ConnectionsPanelProps {
   hasSession: boolean
+  assets?: ConnectionAssetSnapshot
+  activeSessionTitles: Set<string>
+  error?: string
   onNewConnection: () => void
+  onOpenConnection: (profile: ConnectionProfile) => void
+  onQuickConnection: (draft: ConnectionDraft, source: string) => void
+  onCopy: (id: string) => Promise<void>
+  onDelete: (profile: ConnectionProfile) => Promise<void>
+  onCreateGroup: (name: string) => Promise<void>
+  onRenameGroup: (id: string, name: string) => Promise<void>
+  onDeleteGroup: (id: string, name: string) => Promise<void>
 }
 
-function ConnectionsPanel({ hasSession, onNewConnection }: ConnectionsPanelProps) {
+function ConnectionsPanel({ hasSession, assets, activeSessionTitles, error, onNewConnection, onOpenConnection, onQuickConnection, onCopy, onDelete, onCreateGroup, onRenameGroup, onDeleteGroup }: ConnectionsPanelProps) {
+  const [query, setQuery] = useState('')
+  const [quickTarget, setQuickTarget] = useState('')
+  const [quickError, setQuickError] = useState<string>()
+  const [groupName, setGroupName] = useState('')
+  const [selectedId, setSelectedId] = useState<string>()
+  const filteredIds = new Set(filterConnections(assets?.connections ?? [], query).map((profile) => profile.id))
+  const openQuick = () => {
+    try {
+      const parsed = parseQuickTarget(quickTarget)
+      setQuickError(undefined)
+      onQuickConnection({ ...initialConnectionDraft, ...parsed, name: parsed.host }, quickTarget)
+    } catch (cause) {
+      setQuickError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }
   return (
     <aside className="connections-panel" aria-label={t('connectionCenter')}>
       <header className="panel-header">
@@ -135,30 +214,47 @@ function ConnectionsPanel({ hasSession, onNewConnection }: ConnectionsPanelProps
 
       <label className="search-field">
         <Icon name="search" />
-        <input type="search" placeholder={t('searchConnections')} disabled aria-label={t('searchConnections')} />
+        <input type="search" placeholder={t('searchConnections')} value={query} onChange={(event) => setQuery(event.target.value)} aria-label={t('searchConnections')} />
         <kbd>⌘ K</kbd>
       </label>
 
-      <div className="group-heading">
-        <span><Icon name="chevron" />{t('defaultGroup')}</span>
-        <span className="count-badge">0</span>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <div className="group-create">
+        <input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="新建分组" maxLength={64} />
+        <button type="button" onClick={() => { if (groupName.trim()) { void onCreateGroup(groupName.trim()); setGroupName('') } }}><Icon name="plus" /></button>
       </div>
 
-      <div className="empty-list">
+      {assets?.groups.map((group) => {
+        const profiles = assets.connections.filter((profile) => profile.groupId === group.id && filteredIds.has(profile.id))
+        if (query.trim() && profiles.length === 0) return null
+        return <section className="connection-group" key={group.id}>
+          <div className="group-heading">
+            <span><Icon name="chevron" />{group.name}</span>
+            <span className="group-tools"><span className="count-badge">{profiles.length}</span>{group.id !== assets.defaultGroupId && <><button type="button" aria-label={`重命名${group.name}`} onClick={() => { const name = window.prompt('新的分组名称', group.name); if (name?.trim()) void onRenameGroup(group.id, name.trim()) }}>✎</button><button type="button" aria-label={`删除${group.name}`} onClick={() => void onDeleteGroup(group.id, group.name)}>×</button></>}</span>
+          </div>
+          {profiles.map((profile) => <article className={selectedId === profile.id ? 'connection-list-item selected' : 'connection-list-item'} key={profile.id} onDoubleClick={() => !hasSession && onOpenConnection(profile)}>
+            <span className="connection-list-icon"><Icon name="server" /></span>
+            <button className="connection-main" type="button" onClick={() => setSelectedId(profile.id)}><strong><span className={`status-dot ${activeSessionTitles.has(profile.name) ? 'online' : ''}`} />{profile.name}</strong><span>{profile.username}@{profile.host}:{profile.port}</span></button>
+            <div className="connection-actions"><button type="button" onClick={() => onOpenConnection(profile)} aria-label={`编辑${profile.name}`}>✎</button><button type="button" onClick={() => void onCopy(profile.id)} aria-label={`复制${profile.name}`}>⧉</button><button type="button" onClick={() => void onDelete(profile)} aria-label={`删除${profile.name}`}>×</button></div>
+          </article>)}
+        </section>
+      })}
+
+      {(!assets || assets.connections.length === 0) && <div className="empty-list">
         <div className="empty-icon"><Icon name="server" /></div>
         <h2>{t('noConnections')}</h2>
         <p>{t('noConnectionsHint')}</p>
-      </div>
+      </div>}
 
       <div className="prototype-card connection-entry">
         <div className="prototype-icon"><Icon name="connection" /></div>
         <div>
-          <strong>临时 SSH 连接</strong>
-          <span>密码和私钥只在当前连接流程中使用，不会保存。</span>
+          <strong>快速连接</strong>
+          <span>输入 user@host 或 user@host:port，不保存连接配置。</span>
         </div>
-        <button type="button" onClick={onNewConnection} disabled={hasSession}>
-          {hasSession ? '已有活动会话' : '新建连接'}
-        </button>
+        <input className="quick-target" value={quickTarget} onChange={(event) => setQuickTarget(event.target.value)} placeholder="user@host:22" aria-label="快速连接目标" />
+        {quickError && <span className="quick-error">{quickError}</span>}
+        <button type="button" onClick={openQuick} disabled={hasSession}>{hasSession ? '已有活动会话' : '继续'}</button>
       </div>
     </aside>
   )
@@ -248,7 +344,7 @@ function SessionWorkspace({
       </div>
 
       <footer className="workspace-footer">
-        <span><Icon name="shield" />本地优先 · 模拟会话不访问网络</span>
+        <span><Icon name="shield" />本地优先 · 凭据由 Windows 安全存储</span>
         <span>IPC v1</span>
       </footer>
     </section>
@@ -272,7 +368,7 @@ function EmptyWorkspace({
         <Icon name="terminal" />
         {t('newConnection')}
       </button>
-      <span className="empty-footnote">密码和私钥仅用于本次连接，不会保存。</span>
+      <span className="empty-footnote">秘密仅在明确授权时保存到 Windows 凭据库。</span>
     </div>
   )
 }

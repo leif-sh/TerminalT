@@ -3,6 +3,8 @@ import {
   initialConnectionDraft,
   toConnectionRequest,
   validateConnectionDraft,
+  parseQuickTarget,
+  filterConnections,
 } from './types'
 
 describe('connection form', () => {
@@ -55,5 +57,25 @@ describe('connection form', () => {
       username: 'alice',
       authType: 'privateKey',
     })).toMatchObject({ privateKeyPath: expect.any(String) })
+  })
+
+  it('parses quick targets including bracketed IPv6', () => {
+    expect(parseQuickTarget('alice@server.example:2200')).toEqual({ username: 'alice', host: 'server.example', port: 2200 })
+    expect(parseQuickTarget('root@[2001:db8::1]:2222')).toEqual({ username: 'root', host: '2001:db8::1', port: 2222 })
+    expect(() => parseQuickTarget('root@2001:db8::1')).toThrow('方括号')
+  })
+
+
+  it('searches name, host, username, and note without case sensitivity', () => {
+    const profile = {
+      id: 'one', name: 'Production', host: 'api.example', port: 22, username: 'Deploy',
+      authType: 'password' as const, groupId: 'default', note: 'Primary database', timeoutSeconds: 15,
+      createdAt: '', updatedAt: '',
+    }
+    expect(filterConnections([profile], ' production ')).toHaveLength(1)
+    expect(filterConnections([profile], 'EXAMPLE')).toHaveLength(1)
+    expect(filterConnections([profile], 'deploy')).toHaveLength(1)
+    expect(filterConnections([profile], 'database')).toHaveLength(1)
+    expect(filterConnections([profile], 'missing')).toHaveLength(0)
   })
 })

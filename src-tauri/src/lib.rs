@@ -1,3 +1,5 @@
+mod assets;
+mod credentials;
 mod error;
 mod known_hosts;
 mod models;
@@ -7,8 +9,9 @@ mod ssh_client;
 use chrono::Utc;
 use error::AppError;
 use models::{
-    ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, HealthResponse,
-    HostKeyApproval, HostKeyInspection, SessionOutputPayload, SessionState, SessionStatus,
+    ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile, ConnectionProgressPayload,
+    ConnectionRequest, ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval,
+    HostKeyInspection, SaveConnectionRequest, SessionOutputPayload, SessionState, SessionStatus,
     SessionStatusPayload,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
@@ -28,6 +31,76 @@ fn health_check() -> HealthResponse {
         protocol_version: IPC_PROTOCOL_VERSION,
         app_version: env!("CARGO_PKG_VERSION"),
     }
+}
+
+#[tauri::command]
+fn list_connection_assets(
+    store: State<'_, assets::AssetStore>,
+) -> Result<ConnectionAssetSnapshot, AppError> {
+    store.snapshot()
+}
+
+#[tauri::command]
+fn save_connection_profile(
+    store: State<'_, assets::AssetStore>,
+    request: SaveConnectionRequest,
+) -> Result<ConnectionProfile, AppError> {
+    store.save_connection(request)
+}
+
+#[tauri::command]
+fn copy_connection_profile(
+    store: State<'_, assets::AssetStore>,
+    connection_id: String,
+) -> Result<ConnectionProfile, AppError> {
+    store.copy_connection(&connection_id)
+}
+
+#[tauri::command]
+fn delete_connection_profile(
+    store: State<'_, assets::AssetStore>,
+    connection_id: String,
+) -> Result<(), AppError> {
+    store.delete_connection(&connection_id)
+}
+
+#[tauri::command]
+fn save_connection_group(
+    store: State<'_, assets::AssetStore>,
+    request: GroupNameRequest,
+) -> Result<ConnectionGroup, AppError> {
+    store.save_group(request)
+}
+
+#[tauri::command]
+fn delete_connection_group(
+    store: State<'_, assets::AssetStore>,
+    group_id: String,
+) -> Result<(), AppError> {
+    store.delete_group(&group_id)
+}
+
+#[tauri::command]
+fn record_recent_target(
+    store: State<'_, assets::AssetStore>,
+    target: String,
+) -> Result<(), AppError> {
+    store.record_recent_target(&target)
+}
+
+#[tauri::command]
+fn clear_recent_targets(store: State<'_, assets::AssetStore>) -> Result<(), AppError> {
+    store.clear_recent_targets()
+}
+
+#[tauri::command]
+fn list_host_keys(app: AppHandle) -> Result<Vec<known_hosts::HostKeyRecord>, AppError> {
+    known_hosts::KnownHostsStore::new(known_hosts_path(&app)?).list()
+}
+
+#[tauri::command]
+fn delete_host_key(app: AppHandle, host: String, port: u16) -> Result<(), AppError> {
+    known_hosts::KnownHostsStore::new(known_hosts_path(&app)?).delete(&host, port)
 }
 
 #[tauri::command]
@@ -265,6 +338,38 @@ async fn connect_ssh(
 }
 
 #[tauri::command]
+async fn test_saved_connection(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    store: State<'_, assets::AssetStore>,
+    operation_id: String,
+    connection_id: String,
+    temporary_secret: Option<String>,
+    approval: HostKeyApproval,
+) -> Result<ConnectionTestResult, AppError> {
+    let request = store.connection_request(&connection_id, temporary_secret)?;
+    test_ssh_connection(app, operations, operation_id, request, approval).await
+}
+
+#[tauri::command]
+async fn connect_saved_connection(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    store: State<'_, assets::AssetStore>,
+    operation_id: String,
+    connection_id: String,
+    temporary_secret: Option<String>,
+    approval: HostKeyApproval,
+) -> Result<SessionState, AppError> {
+    let request = store.connection_request(&connection_id, temporary_secret)?;
+    let session = connect_ssh(app, operations, operation_id, request, approval).await?;
+    if let Err(error) = store.mark_connected(&connection_id) {
+        log::warn!("failed to update last-connected timestamp: {}", error.code);
+    }
+    Ok(session)
+}
+
+#[tauri::command]
 fn cancel_operation(
     operations: State<'_, OperationRegistry>,
     operation_id: String,
@@ -308,6 +413,11 @@ pub fn run() {
         .manage(OperationRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let asset_path = app.path().app_data_dir()?.join("connections.json");
+            app.manage(assets::AssetStore::new(
+                asset_path,
+                credentials::system_vault(),
+            ));
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -319,6 +429,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
+            list_connection_assets,
+            save_connection_profile,
+            copy_connection_profile,
+            delete_connection_profile,
+            save_connection_group,
+            delete_connection_group,
+            record_recent_target,
+            clear_recent_targets,
+            list_host_keys,
+            delete_host_key,
             create_mock_session,
             write_mock_session,
             resize_mock_session,
@@ -329,6 +449,8 @@ pub fn run() {
             inspect_ssh_host_key,
             test_ssh_connection,
             connect_ssh,
+            test_saved_connection,
+            connect_saved_connection,
             cancel_operation,
         ])
         .build(tauri::generate_context!())

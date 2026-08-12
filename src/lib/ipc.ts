@@ -12,6 +12,11 @@ import type {
   ConnectionTestResult,
   HostKeyApproval,
   HostKeyInspection,
+  ConnectionAssetSnapshot,
+  ConnectionGroup,
+  ConnectionProfile,
+  SaveConnectionRequest,
+  StoredHostKeyRecord,
 } from '../domain/connection/types'
 
 export interface HealthResponse {
@@ -35,6 +40,21 @@ type ProgressHandler = (payload: ConnectionProgressPayload) => void
 const browserOutputHandlers = new Set<OutputHandler>()
 const browserStatusHandlers = new Set<StatusHandler>()
 const browserProgressHandlers = new Set<ProgressHandler>()
+const previewAssetsKey = 'terminalt-preview-assets-v1'
+
+function emptyPreviewAssets(): ConnectionAssetSnapshot {
+  const now = new Date().toISOString()
+  return { schemaVersion: 1, defaultGroupId: 'default', groups: [{ id: 'default', name: '默认分组', createdAt: now, updatedAt: now }], connections: [], recentTargets: [] }
+}
+
+function readPreviewAssets(): ConnectionAssetSnapshot {
+  const stored = localStorage.getItem(previewAssetsKey)
+  return stored ? JSON.parse(stored) as ConnectionAssetSnapshot : emptyPreviewAssets()
+}
+
+function writePreviewAssets(snapshot: ConnectionAssetSnapshot): void {
+  localStorage.setItem(previewAssetsKey, JSON.stringify(snapshot))
+}
 
 function isTauriRuntime(): boolean {
   return '__TAURI_INTERNALS__' in window
@@ -51,6 +71,89 @@ export async function healthCheck(): Promise<HealthResponse> {
   }
 
   return invoke<HealthResponse>('health_check')
+}
+
+export async function listConnectionAssets(): Promise<ConnectionAssetSnapshot> {
+  if (!isTauriRuntime()) return readPreviewAssets()
+  return invoke<ConnectionAssetSnapshot>('list_connection_assets')
+}
+
+export async function saveConnectionProfile(request: SaveConnectionRequest): Promise<ConnectionProfile> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets()
+    const now = new Date().toISOString()
+    const existing = assets.connections.find((item) => item.id === request.id)
+    const profile: ConnectionProfile = {
+      id: request.id ?? crypto.randomUUID(), name: request.name, host: request.host, port: request.port,
+      username: request.username, authType: request.authType,
+      credentialRef: request.rememberCredential ? `TerminalT/preview/${request.id ?? 'new'}` : undefined,
+      privateKeyPath: request.privateKeyPath, groupId: request.groupId, note: request.note,
+      timeoutSeconds: request.timeoutSeconds, lastConnectedAt: existing?.lastConnectedAt,
+      createdAt: existing?.createdAt ?? now, updatedAt: now,
+    }
+    assets.connections = assets.connections.filter((item) => item.id !== profile.id)
+    assets.connections.push(profile)
+    writePreviewAssets(assets)
+    return profile
+  }
+  return invoke<ConnectionProfile>('save_connection_profile', { request })
+}
+
+export async function copyConnectionProfile(connectionId: string): Promise<ConnectionProfile> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets()
+    const source = assets.connections.find((item) => item.id === connectionId)
+    if (!source) throw new Error('连接不存在')
+    const now = new Date().toISOString()
+    const copy = { ...source, id: crypto.randomUUID(), name: `${source.name} - 副本`, credentialRef: undefined, createdAt: now, updatedAt: now, lastConnectedAt: undefined }
+    assets.connections.push(copy)
+    writePreviewAssets(assets)
+    return copy
+  }
+  return invoke<ConnectionProfile>('copy_connection_profile', { connectionId })
+}
+
+export async function deleteConnectionProfile(connectionId: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); assets.connections = assets.connections.filter((item) => item.id !== connectionId); writePreviewAssets(assets); return
+  }
+  await invoke('delete_connection_profile', { connectionId })
+}
+
+export async function saveConnectionGroup(name: string, id?: string): Promise<ConnectionGroup> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); const now = new Date().toISOString()
+    const group = { id: id ?? crypto.randomUUID(), name, createdAt: assets.groups.find((item) => item.id === id)?.createdAt ?? now, updatedAt: now }
+    assets.groups = assets.groups.filter((item) => item.id !== group.id); assets.groups.push(group); writePreviewAssets(assets); return group
+  }
+  return invoke<ConnectionGroup>('save_connection_group', { request: { id, name } })
+}
+
+export async function deleteConnectionGroup(groupId: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); assets.groups = assets.groups.filter((item) => item.id !== groupId); assets.connections = assets.connections.map((item) => item.groupId === groupId ? { ...item, groupId: assets.defaultGroupId } : item); writePreviewAssets(assets); return
+  }
+  await invoke('delete_connection_group', { groupId })
+}
+
+export async function recordRecentTarget(target: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('record_recent_target', { target })
+}
+
+export async function clearRecentTargets(): Promise<void> {
+  if (!isTauriRuntime()) { const assets = readPreviewAssets(); assets.recentTargets = []; writePreviewAssets(assets); return }
+  await invoke('clear_recent_targets')
+}
+
+export async function listHostKeys(): Promise<StoredHostKeyRecord[]> {
+  if (!isTauriRuntime()) return []
+  return invoke<StoredHostKeyRecord[]>('list_host_keys')
+}
+
+export async function deleteHostKey(host: string, port: number): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('delete_host_key', { host, port })
 }
 
 export async function createMockSession(title = '架构验证会话'): Promise<SessionState> {
@@ -167,6 +270,50 @@ export async function connectSsh(
 ): Promise<SessionState> {
   if (!isTauriRuntime()) return createMockSession(request.name)
   return invoke<SessionState>('connect_ssh', { operationId, request, approval })
+}
+
+export async function testSavedConnection(
+  operationId: string,
+  connectionId: string,
+  temporarySecret: string | undefined,
+  approval: HostKeyApproval,
+): Promise<ConnectionTestResult> {
+  if (!isTauriRuntime()) {
+    const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
+    if (!profile) throw new Error('连接不存在')
+    return testSshConnection(operationId, toPreviewRequest(profile, temporarySecret), approval)
+  }
+  return invoke<ConnectionTestResult>('test_saved_connection', { operationId, connectionId, temporarySecret, approval })
+}
+
+export async function connectSavedConnection(
+  operationId: string,
+  connectionId: string,
+  temporarySecret: string | undefined,
+  approval: HostKeyApproval,
+): Promise<SessionState> {
+  if (!isTauriRuntime()) {
+    const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
+    if (!profile) throw new Error('连接不存在')
+    return connectSsh(operationId, toPreviewRequest(profile, temporarySecret), approval)
+  }
+  return invoke<SessionState>('connect_saved_connection', { operationId, connectionId, temporarySecret, approval })
+}
+
+function toPreviewRequest(profile: ConnectionProfile, secret?: string): ConnectionRequest {
+  return {
+    name: profile.name,
+    host: profile.host,
+    port: profile.port,
+    username: profile.username,
+    authType: profile.authType,
+    password: profile.authType === 'password' ? secret ?? 'preview-stored-secret' : '',
+    privateKeyPath: profile.privateKeyPath ?? '',
+    privateKeyPassphrase: profile.authType === 'privateKey' ? secret ?? '' : '',
+    timeoutSeconds: profile.timeoutSeconds,
+    columns: 80,
+    rows: 24,
+  }
 }
 
 export async function cancelOperation(operationId: string): Promise<void> {

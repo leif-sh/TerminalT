@@ -5,6 +5,7 @@ import { Icon } from '../../components/Icon'
 import type {
   ConnectionDraft,
   ConnectionFormErrors,
+  ConnectionGroup,
   ConnectionRequest,
   HostKeyAction,
   HostKeyApproval,
@@ -12,6 +13,7 @@ import type {
 } from '../../domain/connection/types'
 import {
   initialConnectionDraft,
+  toSaveConnectionRequest,
   toConnectionRequest,
   validateConnectionDraft,
 } from '../../domain/connection/types'
@@ -21,22 +23,40 @@ import {
   listenToConnectionProgress,
   normalizeCommandError,
   testSshConnection,
+  testSavedConnection,
   type AppCommandError,
 } from '../../lib/ipc'
 
 interface ConnectionDialogProps {
   open: boolean
+  initialDraft?: ConnectionDraft
+  groups?: ConnectionGroup[]
   onClose: () => void
+  onSave?: (request: ReturnType<typeof toSaveConnectionRequest>) => Promise<void>
   onConnect: (
     operationId: string,
     request: ConnectionRequest,
+    approval: HostKeyApproval,
+  ) => Promise<void>
+  onConnectSaved?: (
+    operationId: string,
+    connectionId: string,
+    temporarySecret: string | undefined,
     approval: HostKeyApproval,
   ) => Promise<void>
 }
 
 type Intent = 'test' | 'connect'
 
-export function ConnectionDialog({ open: visible, onClose, onConnect }: ConnectionDialogProps) {
+export function ConnectionDialog({
+  open: visible,
+  initialDraft: suppliedDraft,
+  groups = [],
+  onClose,
+  onSave,
+  onConnect,
+  onConnectSaved,
+}: ConnectionDialogProps) {
   const [draft, setDraft] = useState<ConnectionDraft>(initialConnectionDraft)
   const [errors, setErrors] = useState<ConnectionFormErrors>({})
   const [inspection, setInspection] = useState<HostKeyInspection>()
@@ -50,6 +70,7 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
 
   const busy = Boolean(operationId)
   const locked = authFailures >= 3
+  const hasStoredCredential = Boolean(suppliedDraft?.id && suppliedDraft.rememberCredential)
 
   useEffect(() => {
     let disposed = false
@@ -67,6 +88,7 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
   }, [operationId])
 
   useEffect(() => {
+    if (visible) setDraft(suppliedDraft ?? initialConnectionDraft)
     if (!visible) {
       setDraft(initialConnectionDraft)
       setErrors({})
@@ -79,7 +101,7 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
       setAuthFailures(0)
       setShowSecret(false)
     }
-  }, [visible])
+  }, [visible, suppliedDraft])
 
   const normalizedRequest = useMemo(() => toConnectionRequest(draft), [draft])
 
@@ -96,7 +118,7 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
   }
 
   const begin = async (nextIntent: Intent) => {
-    const nextErrors = validateConnectionDraft(draft)
+    const nextErrors = validateConnectionDraft(draft, hasStoredCredential)
     setErrors(nextErrors)
     setCommandError(undefined)
     setTestResult(undefined)
@@ -136,11 +158,17 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
     setProgress(selectedIntent === 'test' ? '正在测试认证信息…' : '正在创建远程终端…')
     try {
       if (selectedIntent === 'test') {
-        const result = await testSshConnection(nextOperationId, normalizedRequest, approval)
+        const result = draft.id
+          ? await testSavedConnection(nextOperationId, draft.id, currentSecret(draft), approval)
+          : await testSshConnection(nextOperationId, normalizedRequest, approval)
         setTestResult(result.elapsedMillis)
         setProgress('')
       } else {
-        await onConnect(nextOperationId, normalizedRequest, approval)
+        if (draft.id && onConnectSaved) {
+          await onConnectSaved(nextOperationId, draft.id, currentSecret(draft), approval)
+        } else {
+          await onConnect(nextOperationId, normalizedRequest, approval)
+        }
         onClose()
       }
     } catch (error) {
@@ -182,14 +210,33 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
     if (typeof path === 'string') update('privateKeyPath', path)
   }
 
+  const save = async () => {
+    const nextErrors = validateConnectionDraft(draft, true)
+    if (draft.rememberCredential && !hasStoredCredential && !currentSecret(draft)) {
+      if (draft.authType === 'password') nextErrors.password = '请输入需要保存的密码'
+      else nextErrors.privateKeyPassphrase = '请输入私钥口令，或取消记住口令'
+    }
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length > 0 || !onSave) return
+    setProgress('正在安全保存连接…')
+    try {
+      await onSave(toSaveConnectionRequest(draft))
+      onClose()
+    } catch (error) {
+      handleError(error)
+    } finally {
+      setProgress('')
+    }
+  }
+
   return (
     <div className="dialog-backdrop" role="presentation">
       <section className="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-dialog-title">
         <header className="dialog-header">
           <div>
-            <span className="eyebrow">NEW SSH SESSION</span>
-            <h2 id="connection-dialog-title">新建临时连接</h2>
-            <p>本阶段不会保存连接信息或认证凭据。</p>
+            <span className="eyebrow">{draft.id ? 'EDIT CONNECTION' : 'NEW SSH SESSION'}</span>
+            <h2 id="connection-dialog-title">{draft.id ? '编辑连接' : '新建连接'}</h2>
+            <p>普通数据只保存连接信息，秘密仅在授权时写入 Windows 凭据库。</p>
           </div>
           <button className="dialog-close" type="button" onClick={onClose} disabled={busy} aria-label="关闭"><Icon name="close" /></button>
         </header>
@@ -198,6 +245,13 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
           <Field label="连接名称" error={errors.name}>
             <input value={draft.name} onChange={(event) => update('name', event.target.value)} placeholder="默认使用主机名" maxLength={64} />
           </Field>
+          {groups.length > 0 && (
+            <Field label="分组">
+              <select value={draft.groupId} onChange={(event) => update('groupId', event.target.value)}>
+                {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+              </select>
+            </Field>
+          )}
           <div className="form-grid host-grid">
             <Field label="主机地址" error={errors.host}>
               <input value={draft.host} onChange={(event) => update('host', event.target.value)} placeholder="example.com 或 192.168.1.10" autoFocus />
@@ -236,13 +290,22 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
                   <button type="button" onClick={() => void selectPrivateKey()}><Icon name="folder" />选择</button>
                 </div>
               </Field>
-              <Field label="私钥口令（可选）">
+              <Field label="私钥口令（可选）" error={errors.privateKeyPassphrase}>
                 <div className="secret-input">
                   <input type={showSecret ? 'text' : 'password'} value={draft.privateKeyPassphrase} onChange={(event) => update('privateKeyPassphrase', event.target.value)} />
                   <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? '隐藏' : '显示'}</button>
                 </div>
               </Field>
             </>
+          )}
+          <label className="remember-row">
+            <input type="checkbox" checked={draft.rememberCredential} onChange={(event) => update('rememberCredential', event.target.checked)} />
+            <span>{draft.authType === 'password' ? '记住密码' : '记住私钥口令'}（使用 Windows 凭据库）</span>
+          </label>
+          {onSave && (
+            <Field label="备注" error={errors.note}>
+              <textarea value={draft.note} onChange={(event) => update('note', event.target.value)} maxLength={500} rows={3} placeholder="用途、环境或维护信息" />
+            </Field>
           )}
         </div>
 
@@ -258,6 +321,7 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
         {progress && <div className="connection-progress" role="status"><span className="progress-spinner" />{progress}</div>}
 
         <footer className="dialog-actions">
+          {onSave && <button className="secondary-button" type="button" onClick={() => void save()} disabled={busy}>保存</button>}
           {busy ? (
             <button className="secondary-button danger" type="button" onClick={() => void cancel()}>取消连接</button>
           ) : (
@@ -277,6 +341,11 @@ export function ConnectionDialog({ open: visible, onClose, onConnect }: Connecti
       )}
     </div>
   )
+}
+
+function currentSecret(draft: ConnectionDraft): string | undefined {
+  const secret = draft.authType === 'password' ? draft.password : draft.privateKeyPassphrase
+  return secret || undefined
 }
 
 function Field({ label, error, suffix, children }: { label: string; error?: string; suffix?: string; children: ReactNode }) {
