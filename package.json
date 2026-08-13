@@ -1,7 +1,7 @@
 {
   "name": "terminalt",
   "private": true,
-  "version": "0.1.0-9",
+  "version": "0.1.0-10",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,9 @@
     "test": "vitest run",
     "release:version": "node scripts/release/verify-version.mjs",
     "release:test": "npm run lint && npm test && npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml",
+    "release:audit": "node scripts/release/security-audit.mjs",
+    "release:bundle": "npm run release:test && npm run release:audit && tauri build --bundles nsis",
+    "release:checksums": "node scripts/release/verify-artifacts.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
