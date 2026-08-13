@@ -3,6 +3,7 @@ import type { ITerminalOptions, ITheme } from '@xterm/xterm'
 export type TerminalThemeName = 'dark' | 'light'
 
 export interface TerminalSettings {
+  schemaVersion: number
   fontFamily: string
   fontSize: number
   lineHeight: number
@@ -13,9 +14,12 @@ export interface TerminalSettings {
   confirmCloseSession: boolean
   keepaliveEnabled: boolean
   keepaliveSeconds: number
+  connectionTimeoutSeconds: number
+  defaultDownloadDirectory: string
 }
 
 export const defaultTerminalSettings: TerminalSettings = {
+  schemaVersion: 1,
   fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
   fontSize: 14,
   lineHeight: 1.2,
@@ -26,6 +30,8 @@ export const defaultTerminalSettings: TerminalSettings = {
   confirmCloseSession: true,
   keepaliveEnabled: true,
   keepaliveSeconds: 30,
+  connectionTimeoutSeconds: 15,
+  defaultDownloadDirectory: '',
 }
 
 export const terminalThemes: Record<TerminalThemeName, ITheme> = {
@@ -53,6 +59,7 @@ export function normalizeTerminalSettings(value: unknown): TerminalSettings {
   if (!value || typeof value !== 'object') return { ...defaultTerminalSettings }
   const input = value as Partial<TerminalSettings>
   return {
+    schemaVersion: 1,
     fontFamily: typeof input.fontFamily === 'string' && input.fontFamily.trim()
       ? input.fontFamily.trim()
       : defaultTerminalSettings.fontFamily,
@@ -71,6 +78,8 @@ export function normalizeTerminalSettings(value: unknown): TerminalSettings {
       ? input.keepaliveEnabled
       : defaultTerminalSettings.keepaliveEnabled,
     keepaliveSeconds: clampNumber(input.keepaliveSeconds, 5, 300, defaultTerminalSettings.keepaliveSeconds),
+    connectionTimeoutSeconds: clampNumber(input.connectionTimeoutSeconds, 5, 60, defaultTerminalSettings.connectionTimeoutSeconds),
+    defaultDownloadDirectory: typeof input.defaultDownloadDirectory === 'string' ? input.defaultDownloadDirectory : '',
   }
 }
 

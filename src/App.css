@@ -232,6 +232,30 @@
 .settings-nav span { margin-left: auto; color: #485c74; font-size: 9px; }
 .settings-content { flex: 1; padding: 42px min(7vw, 80px); overflow: auto; }
 .settings-content > header { max-width: 680px; margin-bottom: 27px; }
+.settings-error, .settings-message { max-width: 760px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid rgba(251, 113, 133, .35); border-radius: 8px; color: #f5b0bc; background: rgba(80, 20, 34, .35); font-size: 10px; }
+.settings-message { color: #9cdcc8; border-color: rgba(50, 215, 168, .26); background: rgba(24, 90, 72, .2); }
+.settings-actions-card { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px; }
+.settings-actions-card button, .settings-records button { height: 32px; border: 1px solid rgba(64, 132, 235, .32); border-radius: 7px; padding: 0 11px; color: #9ab8df; background: rgba(24, 61, 111, .26); cursor: pointer; font-size: 10px; }
+.settings-actions-card button.danger { color: #e79aa7; border-color: rgba(220, 81, 105, .35); }
+.settings-records { max-width: 760px; display: grid; gap: 6px; margin-top: 12px; }
+.settings-records > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 11px; border: 1px solid rgba(64, 104, 155, .22); border-radius: 8px; background: rgba(8, 24, 43, .46); }
+.settings-records strong { color: #c5d4e5; font-size: 10px; }
+.settings-records span { min-width: 0; overflow: hidden; color: #657b96; text-overflow: ellipsis; white-space: nowrap; font-size: 8px; }
+.settings-records button { grid-row: 1 / 3; grid-column: 2; }
+.log-path { width: 100%; padding: 8px; color: #7086a1; background: #050c17; font: 9px Consolas, monospace; overflow-wrap: anywhere; }
+.path-setting { display: flex; gap: 6px; }
+.path-setting input { min-width: 0; flex: 1; }
+.path-setting button { border: 1px solid rgba(64, 132, 235, .32); border-radius: 6px; color: #9ab8df; background: rgba(24, 61, 111, .26); cursor: pointer; }
+.terminal-settings-preview { max-width: 760px; min-height: 92px; margin-top: 14px; padding: 20px; border: 1px solid rgba(65, 111, 170, .28); border-radius: 9px; color: #cbd9e9; background: #050b15; }
+.terminal-settings-preview.terminal-theme-light { color: #182337; background: #f5f7fb; }
+.terminal-settings-preview span { color: #32d7a8; }
+.terminal-settings-preview strong { color: #67e8f9; font-weight: 500; }
+.preview-cursor { display: inline-block; width: 2px; height: 1em; margin-left: 3px; vertical-align: middle; background: #5f8cff; }
+.preview-cursor.blink { animation: cursor-blink 1s steps(1) infinite; }
+@keyframes cursor-blink { 50% { opacity: 0; } }
+.error-details summary { cursor: pointer; }
+.error-details pre { max-width: 520px; overflow: auto; color: #8fa1b8; white-space: pre-wrap; font: 8px/1.5 Consolas, monospace; }
+.error-details button { border: 0; color: #8cb1df; background: transparent; cursor: pointer; font-size: 8px; }
 .settings-content h2 { margin: 8px 0; font-size: 25px; }
 .settings-content header p { color: #70829a; font-size: 12px; line-height: 1.6; }
 .settings-card { max-width: 680px; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-card); }

@@ -17,7 +17,9 @@ import type {
   ConnectionProfile,
   SaveConnectionRequest,
   StoredHostKeyRecord,
+  AssetTransferSummary,
 } from '../domain/connection/types'
+import type { TerminalSettings } from '../domain/terminal/settings'
 import type { RemoteDirectoryListing, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
 
 export interface HealthResponse {
@@ -78,6 +80,20 @@ export async function healthCheck(): Promise<HealthResponse> {
   }
 
   return invoke<HealthResponse>('health_check')
+}
+
+export async function loadSettings(): Promise<TerminalSettings> {
+  if (!isTauriRuntime()) return JSON.parse(localStorage.getItem('terminalt-terminal-settings-v1') ?? 'null') as TerminalSettings
+  return invoke<TerminalSettings>('load_settings')
+}
+
+export async function saveSettings(settings: TerminalSettings): Promise<void> {
+  if (!isTauriRuntime()) { localStorage.setItem('terminalt-terminal-settings-v1', JSON.stringify(settings)); return }
+  await invoke('save_settings', { settings })
+}
+
+export async function saveWindowState(state: { x: number; y: number; width: number; height: number; maximized: boolean }): Promise<void> {
+  if (isTauriRuntime()) await invoke('save_window_state', { state })
 }
 
 export async function listConnectionAssets(): Promise<ConnectionAssetSnapshot> {
@@ -153,6 +169,14 @@ export async function clearRecentTargets(): Promise<void> {
   await invoke('clear_recent_targets')
 }
 
+export async function exportConnectionAssets(path: string): Promise<AssetTransferSummary> {
+  return invoke<AssetTransferSummary>('export_connection_assets', { path })
+}
+
+export async function importConnectionAssets(path: string): Promise<AssetTransferSummary> {
+  return invoke<AssetTransferSummary>('import_connection_assets', { path })
+}
+
 export async function listHostKeys(): Promise<StoredHostKeyRecord[]> {
   if (!isTauriRuntime()) return []
   return invoke<StoredHostKeyRecord[]>('list_host_keys')
@@ -162,6 +186,12 @@ export async function deleteHostKey(host: string, port: number): Promise<void> {
   if (!isTauriRuntime()) return
   await invoke('delete_host_key', { host, port })
 }
+
+export async function clearHostKeys(): Promise<void> { if (isTauriRuntime()) await invoke('clear_host_keys') }
+
+export async function diagnosticsPath(): Promise<string> { return isTauriRuntime() ? invoke<string>('diagnostics_path') : '浏览器预览无日志目录' }
+export async function clearDiagnostics(): Promise<void> { if (isTauriRuntime()) await invoke('clear_diagnostics') }
+export async function exportDiagnostics(path: string): Promise<{ files: number; path: string }> { return invoke('export_diagnostics', { path }) }
 
 export async function createMockSession(title = '架构验证会话'): Promise<SessionState> {
   if (!isTauriRuntime()) {

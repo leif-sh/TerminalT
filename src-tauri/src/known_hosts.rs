@@ -56,6 +56,10 @@ impl KnownHostsStore {
         self.write_records(&records)
     }
 
+    pub fn clear(&self) -> Result<(), AppError> {
+        self.write_records(&[])
+    }
+
     pub fn inspect(
         &self,
         host: &str,

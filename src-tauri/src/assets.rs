@@ -12,8 +12,8 @@ use crate::{
     credentials::CredentialVault,
     error::AppError,
     models::{
-        AuthType, ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile, GroupNameRequest,
-        RecentTarget, SaveConnectionRequest,
+        AssetTransferSummary, AuthType, ConnectionAssetSnapshot, ConnectionGroup,
+        ConnectionProfile, GroupNameRequest, RecentTarget, SaveConnectionRequest,
     },
 };
 
@@ -403,6 +403,90 @@ impl AssetStore {
         self.write_document(&document)
     }
 
+    pub fn export_to(&self, path: &Path) -> Result<AssetTransferSummary, AppError> {
+        let _guard = self.lock()?;
+        let mut document = self.read_document()?;
+        document.recent_targets.clear();
+        for connection in &mut document.connections {
+            connection.credential_ref = None;
+        }
+        let bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| AppError::asset_storage("无法生成导出文件", error.to_string()))?;
+        atomic_write(path, &bytes)?;
+        Ok(AssetTransferSummary {
+            connections: document.connections.len(),
+            groups: document.groups.len(),
+            duplicate_names: 0,
+            regenerated_ids: 0,
+            path: path.display().to_string(),
+        })
+    }
+
+    pub fn import_from(&self, path: &Path) -> Result<AssetTransferSummary, AppError> {
+        let bytes = fs::read(path)
+            .map_err(|error| AppError::asset_storage("无法读取导入文件", error.to_string()))?;
+        let imported = parse_document(&bytes)?;
+        for connection in &imported.connections {
+            validate_imported_connection(connection)?;
+        }
+        let _guard = self.lock()?;
+        let mut document = self.read_document()?;
+        let mut group_map = std::collections::HashMap::new();
+        let mut groups_added = 0;
+        for group in imported
+            .groups
+            .into_iter()
+            .filter(|group| group.id != DEFAULT_GROUP_ID)
+        {
+            if let Some(existing) = document
+                .groups
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(&group.name))
+            {
+                group_map.insert(group.id, existing.id.clone());
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                group_map.insert(group.id, id.clone());
+                document.groups.push(ConnectionGroup { id, ..group });
+                groups_added += 1;
+            }
+        }
+        let mut duplicate_names = 0;
+        let mut regenerated_ids = 0;
+        let count = imported.connections.len();
+        for mut connection in imported.connections {
+            if document
+                .connections
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(&connection.name))
+            {
+                duplicate_names += 1;
+            }
+            if document
+                .connections
+                .iter()
+                .any(|item| item.id == connection.id)
+            {
+                connection.id = uuid::Uuid::new_v4().to_string();
+                regenerated_ids += 1;
+            }
+            connection.group_id = group_map
+                .get(&connection.group_id)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_GROUP_ID.to_owned());
+            connection.credential_ref = None;
+            document.connections.push(connection);
+        }
+        self.write_document(&document)?;
+        Ok(AssetTransferSummary {
+            connections: count,
+            groups: groups_added,
+            duplicate_names,
+            regenerated_ids,
+            path: path.display().to_string(),
+        })
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, AppError> {
         self.lock
             .lock()
@@ -484,6 +568,22 @@ impl AssetStore {
             .map_err(|error| AppError::asset_storage("无法序列化连接数据", error.to_string()))?;
         atomic_write(&self.path, &bytes)
     }
+}
+
+fn validate_imported_connection(connection: &ConnectionProfile) -> Result<(), AppError> {
+    if connection.name.trim().is_empty()
+        || connection.name.chars().count() > 64
+        || connection.host.trim().is_empty()
+        || connection.username.trim().is_empty()
+        || connection.username.chars().count() > 128
+        || !(5..=60).contains(&connection.timeout_seconds)
+    {
+        return Err(AppError::validation(format!(
+            "导入连接“{}”的字段无效",
+            connection.name
+        )));
+    }
+    Ok(())
 }
 
 fn validate_connection(request: &SaveConnectionRequest) -> Result<(), AppError> {
@@ -885,6 +985,42 @@ mod tests {
         assert!(std::fs::read_to_string(path)
             .unwrap()
             .contains("\"schemaVersion\": 1"));
+    }
+
+    #[test]
+    fn export_omits_credentials_and_import_regenerates_conflicting_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::new(
+            directory.path().join("connections.json"),
+            std::sync::Arc::new(MemoryVault::default()),
+        );
+        store.save_connection(request(DEFAULT_GROUP_ID)).unwrap();
+        let export = directory.path().join("export.json");
+        store.export_to(&export).unwrap();
+        let content = std::fs::read_to_string(&export).unwrap();
+        assert!(!content.contains("must-not-be-in-json"));
+        assert!(!content.contains("TerminalT/connection/"));
+        let summary = store.import_from(&export).unwrap();
+        assert_eq!(summary.connections, 1);
+        assert_eq!(summary.regenerated_ids, 1);
+        assert_eq!(store.snapshot().unwrap().connections.len(), 2);
+    }
+
+    #[test]
+    fn future_import_version_is_rejected_transactionally() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::new(
+            directory.path().join("connections.json"),
+            std::sync::Arc::new(MemoryVault::default()),
+        );
+        let import = directory.path().join("future.json");
+        std::fs::write(
+            &import,
+            br#"{"schemaVersion":99,"groups":[],"connections":[],"recentTargets":[]}"#,
+        )
+        .unwrap();
+        assert!(store.import_from(&import).is_err());
+        assert!(store.snapshot().unwrap().connections.is_empty());
     }
 }
 

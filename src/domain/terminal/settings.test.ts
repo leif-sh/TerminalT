@@ -10,6 +10,7 @@ describe('terminal settings', () => {
       confirmCloseSession: true,
       keepaliveEnabled: true,
       keepaliveSeconds: 30,
+      connectionTimeoutSeconds: 15,
     })
   })
 
@@ -25,6 +26,13 @@ describe('terminal settings', () => {
     expect(normalizeTerminalSettings({ keepaliveEnabled: false, keepaliveSeconds: 999 })).toMatchObject({
       keepaliveEnabled: false,
       keepaliveSeconds: 300,
+    })
+  })
+
+  it('normalizes connection timeout and download directory', () => {
+    expect(normalizeTerminalSettings({ connectionTimeoutSeconds: 90, defaultDownloadDirectory: 'D:\\Downloads' })).toMatchObject({
+      connectionTimeoutSeconds: 60,
+      defaultDownloadDirectory: 'D:\\Downloads',
     })
   })
 })

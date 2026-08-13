@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import './App.css'
 import { Icon } from './components/Icon'
 import { TerminalView } from './features/terminal/TerminalView'
@@ -8,16 +9,17 @@ import { ConnectionDialog } from './features/connections/ConnectionDialog'
 import type { ConnectionAssetSnapshot, ConnectionDraft, ConnectionProfile, ConnectionRequest, HostKeyApproval, SaveConnectionRequest } from './domain/connection/types'
 import { draftFromProfile, filterConnections, initialConnectionDraft, parseQuickTarget, toReconnectDraft } from './domain/connection/types'
 import {
-  copyConnectionProfile, deleteConnectionGroup, deleteConnectionProfile, healthCheck,
-  listConnectionAssets, normalizeCommandError, recordRecentTarget, saveConnectionGroup,
-  saveConnectionProfile, type HealthResponse,
+  clearDiagnostics, clearHostKeys, clearRecentTargets, copyConnectionProfile, deleteConnectionGroup, deleteConnectionProfile,
+  deleteHostKey, diagnosticsPath, exportConnectionAssets, exportDiagnostics, healthCheck, importConnectionAssets,
+  listConnectionAssets, listHostKeys, loadSettings, normalizeCommandError, recordRecentTarget,
+  saveConnectionGroup, saveConnectionProfile, saveSettings, type HealthResponse,
+  saveWindowState,
 } from './lib/ipc'
 import { t } from './lib/i18n'
 import type { TerminalSettings } from './domain/terminal/settings'
 import { normalizeTerminalSettings } from './domain/terminal/settings'
 
 type View = 'connections' | 'settings'
-const terminalSettingsKey = 'terminalt-terminal-settings-v1'
 
 function App() {
   const [view, setView] = useState<View>('connections')
@@ -30,6 +32,7 @@ function App() {
   const [assetError, setAssetError] = useState<string>()
   const [reconnectSessionId, setReconnectSessionId] = useState<string>()
   const [terminalSettings, setTerminalSettings] = useState(readTerminalSettings)
+  const [settingsError, setSettingsError] = useState<string>()
   const {
     sessions,
     activeSessionId,
@@ -73,11 +76,38 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return
+    let disposed = false
+    let timer: number | undefined
+    const unlisteners: Array<() => void> = []
+    void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      const appWindow = getCurrentWindow()
+      const persist = () => {
+        window.clearTimeout(timer)
+        timer = window.setTimeout(async () => {
+          const [position, size, maximized] = await Promise.all([appWindow.outerPosition(), appWindow.outerSize(), appWindow.isMaximized()])
+          await saveWindowState({ x: position.x, y: position.y, width: size.width, height: size.height, maximized })
+        }, 300)
+      }
+      const listeners = await Promise.all([appWindow.onMoved(persist), appWindow.onResized(persist)])
+      if (disposed) listeners.forEach((dispose) => dispose()); else unlisteners.push(...listeners)
+    })
+    return () => { disposed = true; window.clearTimeout(timer); unlisteners.forEach((dispose) => dispose()) }
+  }, [])
+
   useEffect(() => { void refreshAssets() }, [])
 
   useEffect(() => {
-    localStorage.setItem(terminalSettingsKey, JSON.stringify(terminalSettings))
-  }, [terminalSettings])
+    void loadSettings().then((value) => setTerminalSettings(normalizeTerminalSettings(value))).catch((cause) => setSettingsError(normalizeCommandError(cause).message))
+  }, [])
+
+  const updateSettings = async (next: TerminalSettings) => {
+    const previous = terminalSettings
+    setTerminalSettings(next)
+    try { await saveSettings(next); setSettingsError(undefined) }
+    catch (cause) { setTerminalSettings(previous); setSettingsError(normalizeCommandError(cause).message) }
+  }
 
   const requestCloseSession = useCallback(async (sessionId: string) => {
     const session = sessions.find((candidate) => candidate.id === sessionId)
@@ -182,9 +212,9 @@ function App() {
               assets={assets}
               activeSessionTitles={new Set(sessions.map((session) => session.title))}
               error={assetError}
-              onNewConnection={() => { setQuickSource(undefined); setDialogDraft(undefined); setConnectionDialogOpen(true) }}
+              onNewConnection={() => { setQuickSource(undefined); setDialogDraft({ ...initialConnectionDraft, timeoutSeconds: terminalSettings.connectionTimeoutSeconds }); setConnectionDialogOpen(true) }}
               onOpenConnection={(profile) => { setQuickSource(undefined); setDialogDraft(draftFromProfile(profile)); setConnectionDialogOpen(true) }}
-              onQuickConnection={(draft, source) => { setQuickSource(source); setDialogDraft(draft); setConnectionDialogOpen(true) }}
+              onQuickConnection={(draft, source) => { setQuickSource(source); setDialogDraft({ ...draft, timeoutSeconds: terminalSettings.connectionTimeoutSeconds }); setConnectionDialogOpen(true) }}
               onCopy={(id) => runAssetAction(() => copyConnectionProfile(id))}
               onDelete={async (profile) => {
                 if (window.confirm(`删除连接“${profile.name}”？已建立的会话不会关闭，私钥文件不会被删除。`)) {
@@ -204,7 +234,7 @@ function App() {
               activeSessionId={activeSessionId}
               activeSessionTitle={activeSession?.title}
               error={error}
-              onNewConnection={() => { setQuickSource(undefined); setDialogDraft(undefined); setConnectionDialogOpen(true) }}
+              onNewConnection={() => { setQuickSource(undefined); setDialogDraft({ ...initialConnectionDraft, timeoutSeconds: terminalSettings.connectionTimeoutSeconds }); setConnectionDialogOpen(true) }}
               onActivateSession={activateSession}
               settings={terminalSettings}
               onCloseSession={requestCloseSession}
@@ -212,7 +242,7 @@ function App() {
             />
           </>
         ) : (
-          <SettingsView settings={terminalSettings} onChange={setTerminalSettings} />
+          <SettingsView settings={terminalSettings} assets={assets} error={settingsError} onAssetsChanged={refreshAssets} onChange={(value) => void updateSettings(value)} />
         )}
       </section>
       <ConnectionDialog
@@ -475,6 +505,7 @@ function SessionWorkspace({
                   onClose={() => setSftpSessions((current) => {
                     const next = new Set(current); next.delete(session.id); return next
                   })}
+                  defaultDownloadDirectory={settings.defaultDownloadDirectory}
                 />
               </div>
             )
@@ -512,20 +543,32 @@ function EmptyWorkspace({
   )
 }
 
-function SettingsView({ settings, onChange }: { settings: TerminalSettings; onChange: (settings: TerminalSettings) => void }) {
+function SettingsView({ settings, assets, error, onChange, onAssetsChanged }: { settings: TerminalSettings; assets?: ConnectionAssetSnapshot; error?: string; onChange: (settings: TerminalSettings) => void; onAssetsChanged: () => Promise<void> }) {
+  const [section, setSection] = useState<'general' | 'terminal' | 'security' | 'logs'>('terminal')
+  const [hostKeys, setHostKeys] = useState<Awaited<ReturnType<typeof listHostKeys>>>([])
+  const [message, setMessage] = useState<string>()
+  const [logPath, setLogPath] = useState('')
   const update = <Key extends keyof TerminalSettings>(key: Key, value: TerminalSettings[Key]) => {
     onChange(normalizeTerminalSettings({ ...settings, [key]: value }))
   }
+  useEffect(() => { if (section === 'security') void listHostKeys().then(setHostKeys); if (section === 'logs') void diagnosticsPath().then(setLogPath) }, [section])
+  const exportAssets = async () => { const path = await save({ defaultPath: 'terminalt-connections.json', filters: [{ name: 'JSON', extensions: ['json'] }] }); if (!path) return; const result = await exportConnectionAssets(path); setMessage(`已导出 ${result.connections} 个连接、${result.groups} 个分组到 ${result.path}`) }
+  const importAssets = async () => { const path = await open({ multiple: false, filters: [{ name: 'JSON', extensions: ['json'] }] }); if (!path) return; const result = await importConnectionAssets(path); await onAssetsChanged(); setMessage(`已导入 ${result.connections} 个连接；重名 ${result.duplicateNames}，重建 ID ${result.regeneratedIds}`) }
   return (
     <section className="settings-layout">
       <aside className="settings-sidebar">
         <header className="panel-header">
           <div><span className="eyebrow">PREFERENCES</span><h1>{t('settings')}</h1></div>
         </header>
-        <button className="settings-nav" type="button"><Icon name="settings" />{t('generalSettings')}</button>
-        <button className="settings-nav active" type="button"><Icon name="terminal" />{t('terminalSettings')}</button>
+        <button className={section === 'general' ? 'settings-nav active' : 'settings-nav'} type="button" onClick={() => setSection('general')}><Icon name="settings" />通用与连接</button>
+        <button className={section === 'terminal' ? 'settings-nav active' : 'settings-nav'} type="button" onClick={() => setSection('terminal')}><Icon name="terminal" />{t('terminalSettings')}</button>
+        <button className={section === 'security' ? 'settings-nav active' : 'settings-nav'} type="button" onClick={() => setSection('security')}><Icon name="shield" />安全与数据</button>
+        <button className={section === 'logs' ? 'settings-nav active' : 'settings-nav'} type="button" onClick={() => setSection('logs')}><Icon name="server" />诊断日志</button>
       </aside>
       <div className="settings-content">
+        {error && <div className="settings-error" role="alert">{error}</div>}
+        {message && <div className="settings-message">{message}</div>}
+        {section === 'terminal' && <>
         <header>
           <span className="eyebrow">TERMINAL</span>
           <h2>终端显示与会话</h2>
@@ -539,10 +582,8 @@ function SettingsView({ settings, onChange }: { settings: TerminalSettings; onCh
           <SettingControl label="光标形状" hint="块、竖线或下划线"><select value={settings.cursorStyle} onChange={(event) => update('cursorStyle', event.target.value as TerminalSettings['cursorStyle'])}><option value="block">块</option><option value="bar">竖线</option><option value="underline">下划线</option></select></SettingControl>
           <SettingControl label="光标闪烁" hint="应用到全部会话"><input type="checkbox" checked={settings.cursorBlink} onChange={(event) => update('cursorBlink', event.target.checked)} /></SettingControl>
           <SettingControl label="滚动缓冲" hint="1,000～100,000 行"><input type="number" min="1000" max="100000" step="1000" value={settings.scrollback} onChange={(event) => update('scrollback', Number(event.target.value))} /></SettingControl>
-          <SettingControl label="关闭会话确认" hint="连接中的标签关闭前提示"><input type="checkbox" checked={settings.confirmCloseSession} onChange={(event) => update('confirmCloseSession', event.target.checked)} /></SettingControl>
-          <SettingControl label="SSH Keepalive" hint="新会话和手动重连时生效"><input type="checkbox" checked={settings.keepaliveEnabled} onChange={(event) => update('keepaliveEnabled', event.target.checked)} /></SettingControl>
-          <SettingControl label="Keepalive 间隔" hint="5～300 秒"><input type="number" min="5" max="300" disabled={!settings.keepaliveEnabled} value={settings.keepaliveSeconds} onChange={(event) => update('keepaliveSeconds', Number(event.target.value))} /></SettingControl>
         </div>
+        <div className={`terminal-settings-preview terminal-theme-${settings.theme}`} style={{ fontFamily: settings.fontFamily, fontSize: settings.fontSize, lineHeight: settings.lineHeight }}><span>terminalt@preview</span> $ echo "设置预览"<br /><strong>设置预览</strong><i className={`preview-cursor ${settings.cursorBlink ? 'blink' : ''}`} /></div>
         <div className="architecture-note">
           <Icon name="server" />
           <div>
@@ -550,6 +591,20 @@ function SettingsView({ settings, onChange }: { settings: TerminalSettings; onCh
             <span>终端设置保存在本机，不包含服务器或凭据信息。</span>
           </div>
         </div>
+        </>}
+        {section === 'general' && <><header><span className="eyebrow">GENERAL</span><h2>通用与连接行为</h2><p>连接参数在新会话和手动重连时生效。</p></header><div className="settings-card">
+          <SettingControl label="关闭会话确认" hint="连接中的标签关闭前提示"><input type="checkbox" checked={settings.confirmCloseSession} onChange={(event) => update('confirmCloseSession', event.target.checked)} /></SettingControl>
+          <SettingControl label="连接超时" hint="5～60 秒，新会话生效"><input type="number" min="5" max="60" value={settings.connectionTimeoutSeconds} onChange={(event) => update('connectionTimeoutSeconds', Number(event.target.value))} /></SettingControl>
+          <SettingControl label="SSH Keepalive" hint="新会话和手动重连时生效"><input type="checkbox" checked={settings.keepaliveEnabled} onChange={(event) => update('keepaliveEnabled', event.target.checked)} /></SettingControl>
+          <SettingControl label="Keepalive 间隔" hint="5～300 秒"><input type="number" min="5" max="300" disabled={!settings.keepaliveEnabled} value={settings.keepaliveSeconds} onChange={(event) => update('keepaliveSeconds', Number(event.target.value))} /></SettingControl>
+          <SettingControl label="默认下载目录" hint="目录必须存在并可写"><div className="path-setting"><input readOnly value={settings.defaultDownloadDirectory} /><button type="button" onClick={async () => { const path = await open({ directory: true, multiple: false, defaultPath: settings.defaultDownloadDirectory }); if (path) update('defaultDownloadDirectory', path) }}>选择</button></div></SettingControl>
+        </div></>}
+        {section === 'security' && <><header><span className="eyebrow">SECURITY & DATA</span><h2>历史、主机指纹与数据迁移</h2><p>导出不包含密码、口令、私钥内容或凭据引用。</p></header><div className="settings-card settings-actions-card">
+          <button type="button" onClick={() => void exportAssets()}>导出连接配置</button><button type="button" onClick={() => void importAssets()}>导入连接配置</button>
+          <button type="button" onClick={() => { if (window.confirm('清除全部快速连接历史？')) void clearRecentTargets().then(onAssetsChanged) }}>清除最近历史（{assets?.recentTargets.length ?? 0}）</button>
+          <button className="danger" type="button" onClick={() => { if (window.confirm('清除全部主机指纹？下次连接将重新确认服务器身份。')) void clearHostKeys().then(() => setHostKeys([])) }}>清除全部指纹</button>
+        </div><div className="settings-records">{hostKeys.map((record) => <div key={`${record.host}:${record.port}`}><strong>{record.host}:{record.port}</strong><span>{record.algorithm} · {record.fingerprintSha256} · {new Date(record.trustedAt).toLocaleString()}</span><button type="button" onClick={() => void deleteHostKey(record.host, record.port).then(() => listHostKeys().then(setHostKeys))}>删除</button></div>)}</div></>}
+        {section === 'logs' && <><header><span className="eyebrow">DIAGNOSTICS</span><h2>诊断日志</h2><p>保留 7 天、最多 10 MB；不记录终端正文、密码或私钥内容。</p></header><div className="settings-card settings-actions-card"><span className="log-path">{logPath}</span><button type="button" onClick={() => void navigator.clipboard.writeText(logPath)}>复制日志位置</button><button type="button" onClick={async () => { const path = await save({ defaultPath: 'terminalt-diagnostics.log' }); if (path) setMessage(`已导出 ${(await exportDiagnostics(path)).files} 个日志文件`) }}>导出脱敏日志</button><button className="danger" type="button" onClick={() => { if (window.confirm('清除全部本地诊断日志？')) void clearDiagnostics().then(() => setMessage('诊断日志已清除')) }}>清除日志</button></div></>}
       </div>
     </section>
   )
@@ -566,11 +621,7 @@ function SettingControl({ label, hint, children }: { label: string; hint: string
 }
 
 function readTerminalSettings(): TerminalSettings {
-  try {
-    return normalizeTerminalSettings(JSON.parse(localStorage.getItem(terminalSettingsKey) ?? 'null'))
-  } catch {
-    return normalizeTerminalSettings(null)
-  }
+  return normalizeTerminalSettings(null)
 }
 
 

@@ -78,6 +78,14 @@ export interface ConnectionAssetSnapshot {
   recentTargets: RecentTarget[]
 }
 
+export interface AssetTransferSummary {
+  connections: number
+  groups: number
+  duplicateNames: number
+  regeneratedIds: number
+  path: string
+}
+
 export interface SaveConnectionRequest {
   id?: string
   name: string

@@ -1,24 +1,73 @@
 mod assets;
 mod credentials;
+mod diagnostics;
 mod error;
 mod known_hosts;
 mod models;
 mod session;
+mod settings;
 mod ssh_client;
 
 use chrono::Utc;
 use error::AppError;
 use models::{
-    ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile, ConnectionProgressPayload,
-    ConnectionRequest, ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval,
-    HostKeyInspection, KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing,
-    SaveConnectionRequest, SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus,
-    SessionStatusPayload, TransferDirection, TransferTask,
+    AssetTransferSummary, ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile,
+    ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, GroupNameRequest,
+    HealthResponse, HostKeyApproval, HostKeyInspection, KeepaliveSettings,
+    ReconnectSavedSessionRequest, RemoteDirectoryListing, SaveConnectionRequest,
+    SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
+    TransferDirection, TransferTask, WindowState,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{sync::oneshot, time};
 use uuid::Uuid;
+
+#[tauri::command]
+fn load_settings(
+    app: AppHandle,
+    store: State<'_, settings::SettingsStore>,
+) -> Result<settings::AppSettings, AppError> {
+    let download = app
+        .path()
+        .download_dir()
+        .map_err(|error| AppError::asset_storage("无法确定系统下载目录", error.to_string()))?;
+    store.load(&download)
+}
+
+#[tauri::command]
+fn save_settings(
+    store: State<'_, settings::SettingsStore>,
+    settings: settings::AppSettings,
+) -> Result<(), AppError> {
+    store.save(&settings)
+}
+
+#[tauri::command]
+fn save_window_state(
+    store: State<'_, settings::SettingsStore>,
+    state: WindowState,
+) -> Result<(), AppError> {
+    store.save_window(&state)
+}
+
+#[tauri::command]
+fn diagnostics_path(store: State<'_, diagnostics::DiagnosticLog>) -> String {
+    store.directory()
+}
+
+#[tauri::command]
+fn clear_diagnostics(store: State<'_, diagnostics::DiagnosticLog>) -> Result<(), AppError> {
+    store.clear()
+}
+
+#[tauri::command]
+fn export_diagnostics(
+    store: State<'_, diagnostics::DiagnosticLog>,
+    path: String,
+) -> Result<diagnostics::LogExportSummary, AppError> {
+    store.export_filtered(std::path::Path::new(&path))
+}
 
 const IPC_PROTOCOL_VERSION: u16 = 1;
 const SESSION_OUTPUT_EVENT: &str = "session-output";
@@ -95,6 +144,22 @@ fn clear_recent_targets(store: State<'_, assets::AssetStore>) -> Result<(), AppE
 }
 
 #[tauri::command]
+fn export_connection_assets(
+    store: State<'_, assets::AssetStore>,
+    path: String,
+) -> Result<AssetTransferSummary, AppError> {
+    store.export_to(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn import_connection_assets(
+    store: State<'_, assets::AssetStore>,
+    path: String,
+) -> Result<AssetTransferSummary, AppError> {
+    store.import_from(std::path::Path::new(&path))
+}
+
+#[tauri::command]
 fn list_host_keys(app: AppHandle) -> Result<Vec<known_hosts::HostKeyRecord>, AppError> {
     known_hosts::KnownHostsStore::new(known_hosts_path(&app)?).list()
 }
@@ -102,6 +167,11 @@ fn list_host_keys(app: AppHandle) -> Result<Vec<known_hosts::HostKeyRecord>, App
 #[tauri::command]
 fn delete_host_key(app: AppHandle, host: String, port: u16) -> Result<(), AppError> {
     known_hosts::KnownHostsStore::new(known_hosts_path(&app)?).delete(&host, port)
+}
+
+#[tauri::command]
+fn clear_host_keys(app: AppHandle) -> Result<(), AppError> {
+    known_hosts::KnownHostsStore::new(known_hosts_path(&app)?).clear()
 }
 
 #[tauri::command]
@@ -592,11 +662,44 @@ pub fn run() {
         .manage(OperationRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let asset_path = app.path().app_data_dir()?.join("connections.json");
+            let data_dir = app.path().app_data_dir()?;
+            let asset_path = data_dir.join("connections.json");
             app.manage(assets::AssetStore::new(
                 asset_path,
                 credentials::system_vault(),
             ));
+            app.manage(settings::SettingsStore::new(data_dir.join("settings.json")));
+            let diagnostics = diagnostics::DiagnosticLog::new(data_dir.join("logs"));
+            diagnostics.record(
+                "application-start",
+                None,
+                &format!(
+                    "version={} platform={}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS
+                ),
+            );
+            app.manage(diagnostics);
+            if let Some(state) = app.state::<settings::SettingsStore>().load_window() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let visible = window.available_monitors()?.iter().any(|monitor| {
+                        let position = monitor.position();
+                        let size = monitor.size();
+                        state.x < position.x + size.width as i32
+                            && state.y < position.y + size.height as i32
+                            && state.x + state.width as i32 > position.x
+                            && state.y + state.height as i32 > position.y
+                    });
+                    if visible {
+                        let _ = window.set_position(tauri::PhysicalPosition::new(state.x, state.y));
+                        let _ =
+                            window.set_size(tauri::PhysicalSize::new(state.width, state.height));
+                        if state.maximized {
+                            let _ = window.maximize();
+                        }
+                    }
+                }
+            }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -608,6 +711,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
+            load_settings,
+            save_settings,
+            save_window_state,
+            diagnostics_path,
+            clear_diagnostics,
+            export_diagnostics,
             list_connection_assets,
             save_connection_profile,
             copy_connection_profile,
@@ -616,8 +725,11 @@ pub fn run() {
             delete_connection_group,
             record_recent_target,
             clear_recent_targets,
+            export_connection_assets,
+            import_connection_assets,
             list_host_keys,
             delete_host_key,
+            clear_host_keys,
             create_mock_session,
             write_mock_session,
             resize_mock_session,

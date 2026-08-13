@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { Icon } from '../../components/Icon'
+import { ErrorDetails } from '../../components/ErrorDetails'
 import type { RemoteDirectoryEntry, RemoteDirectoryListing, TransferTask } from '../../domain/sftp/types'
 import type { SessionState } from '../../domain/session/types'
-import { cancelTransfer, createRemoteDirectory, deleteRemoteEntry, listenToTransferProgress, listRemoteDirectory, normalizeCommandError, renameRemoteEntry, startTransfer } from '../../lib/ipc'
+import { cancelTransfer, createRemoteDirectory, deleteRemoteEntry, listenToTransferProgress, listRemoteDirectory, normalizeCommandError, renameRemoteEntry, startTransfer, type AppCommandError } from '../../lib/ipc'
 
 interface SftpPanelProps {
   session: SessionState
   visible: boolean
   onClose: () => void
+  defaultDownloadDirectory?: string
 }
 
 function formatSize(size: number): string {
@@ -18,11 +20,11 @@ function formatSize(size: number): string {
   return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
-export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
+export function SftpPanel({ session, visible, onClose, defaultDownloadDirectory }: SftpPanelProps) {
   const [listing, setListing] = useState<RemoteDirectoryListing>()
   const [path, setPath] = useState('')
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string>()
+  const [error, setError] = useState<AppCommandError>()
   const [selected, setSelected] = useState<RemoteDirectoryEntry>()
   const [dialog, setDialog] = useState<'create' | 'rename' | 'delete'>()
   const [name, setName] = useState('')
@@ -39,7 +41,7 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
       setPath(next.path)
       setSelected(undefined)
     } catch (cause) {
-      setError(normalizeCommandError(cause).message)
+      setError(normalizeCommandError(cause))
     } finally {
       setLoading(false)
     }
@@ -81,7 +83,7 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
       setDialog(undefined)
       await browse(listing.path)
     } catch (cause) {
-      setError(normalizeCommandError(cause).message)
+      setError(normalizeCommandError(cause))
       setDialog(undefined)
     } finally {
       setMutating(false)
@@ -98,21 +100,22 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
     const exists = listing.entries.some((entry) => entry.name === fileName)
     if (exists && !window.confirm(`远端已存在“${fileName}”，确定覆盖吗？`)) return
     try { await startTransfer(session.id, 'upload', source, target, exists) }
-    catch (cause) { setError(normalizeCommandError(cause).message) }
+    catch (cause) { setError(normalizeCommandError(cause)) }
   }
 
   const download = async () => {
     if (!selected || selected.kind !== 'file') return
-    const target = await save({ defaultPath: selected.name })
+    const defaultPath = defaultDownloadDirectory ? `${defaultDownloadDirectory.replace(/[\\/]$/, '')}\\${selected.name}` : selected.name
+    const target = await save({ defaultPath })
     if (!target) return
     try { await startTransfer(session.id, 'download', selected.path, target, true) }
-    catch (cause) { setError(normalizeCommandError(cause).message) }
+    catch (cause) { setError(normalizeCommandError(cause)) }
   }
 
   const retry = async (task: TransferTask) => {
     if (!window.confirm(`重新传输“${task.fileName}”并在目标存在时覆盖吗？`)) return
     try { await startTransfer(session.id, task.direction, task.source, task.target, true) }
-    catch (cause) { setError(normalizeCommandError(cause).message) }
+    catch (cause) { setError(normalizeCommandError(cause)) }
   }
 
   return (
@@ -133,7 +136,7 @@ export function SftpPanel({ session, visible, onClose }: SftpPanelProps) {
         <button type="button" disabled={!selected || loading} onClick={() => openDialog('rename')}>重命名</button>
         <button className="danger" type="button" disabled={!selected || loading} onClick={() => openDialog('delete')}>删除</button>
       </div>
-      {error && <div className="sftp-error" role="alert"><span>{error}</span><button type="button" onClick={() => void browse(listing?.path)}>重试</button></div>}
+      {error && <div className="sftp-error" role="alert"><ErrorDetails error={error} /><button type="button" onClick={() => void browse(listing?.path)}>重试</button></div>}
       {loading && !listing ? <div className="sftp-loading">正在建立 SFTP 通道…</div> : (
         <div className="sftp-list" role="list">
           {listing?.entries.map((entry) => (

@@ -249,6 +249,26 @@ pub struct ConnectionAssetSnapshot {
     pub recent_targets: Vec<RecentTarget>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetTransferSummary {
+    pub connections: usize,
+    pub groups: usize,
+    pub duplicate_names: usize,
+    pub regenerated_ids: usize,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowState {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub maximized: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupNameRequest {

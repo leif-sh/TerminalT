@@ -351,6 +351,11 @@ async fn run_session(
     channel: russh::Channel<client::Msg>,
     mut commands: mpsc::Receiver<SessionCommand>,
 ) {
+    app.state::<crate::diagnostics::DiagnosticLog>().record(
+        "ssh-session-start",
+        None,
+        &format!("session={session_id}"),
+    );
     let handle = Arc::new(handle);
     let (sftp_commands, sftp_receiver) = mpsc::channel(8);
     let sftp_worker =
@@ -465,10 +470,15 @@ async fn run_session(
     let _ = app.emit(
         SESSION_STATUS_EVENT,
         SessionStatusPayload {
-            session_id,
+            session_id: session_id.clone(),
             status: SessionStatus::Disconnected,
-            message: Some(final_message),
+            message: Some(final_message.clone()),
         },
+    );
+    app.state::<crate::diagnostics::DiagnosticLog>().record(
+        "ssh-session-end",
+        None,
+        &format!("session={session_id} result={final_message}"),
     );
 }
 
@@ -824,6 +834,14 @@ async fn run_transfer(
             task.error = Some(error.message);
         }
     }
+    app.state::<crate::diagnostics::DiagnosticLog>().record(
+        "sftp-transfer",
+        task.error.as_deref(),
+        &format!(
+            "session={} direction={:?} status={:?} bytes={}",
+            task.session_id, task.direction, task.status, task.transferred_bytes
+        ),
+    );
     emit_transfer(&app, task);
 }
 
