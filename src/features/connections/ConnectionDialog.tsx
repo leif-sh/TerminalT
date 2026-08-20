@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { homeDir, join } from '@tauri-apps/api/path'
 import { open } from '@tauri-apps/plugin-dialog'
 import { Icon } from '../../components/Icon'
@@ -10,6 +10,8 @@ import type {
   HostKeyAction,
   HostKeyApproval,
   HostKeyInspection,
+  AuthenticationPromptPayload,
+  AgentIdentityInfo,
 } from '../../domain/connection/types'
 import {
   initialConnectionDraft,
@@ -21,7 +23,10 @@ import {
   cancelOperation,
   inspectSshHostKey,
   listenToConnectionProgress,
+  listenToAuthenticationPrompt,
+  listSshAgentIdentities,
   normalizeCommandError,
+  respondAuthenticationPrompt,
   testSshConnection,
   testSavedConnection,
   type AppCommandError,
@@ -66,11 +71,16 @@ export function ConnectionDialog({
   const [inspection, setInspection] = useState<HostKeyInspection>()
   const [intent, setIntent] = useState<Intent>('connect')
   const [operationId, setOperationId] = useState<string>()
+  const operationIdRef = useRef<string | undefined>(undefined)
   const [progress, setProgress] = useState('')
   const [commandError, setCommandError] = useState<AppCommandError>()
   const [testResult, setTestResult] = useState<number>()
   const [authFailures, setAuthFailures] = useState(0)
   const [showSecret, setShowSecret] = useState(false)
+  const [authenticationPrompt, setAuthenticationPrompt] = useState<AuthenticationPromptPayload>()
+  const [promptAnswers, setPromptAnswers] = useState<Record<string, string>>({})
+  const [agentIdentities, setAgentIdentities] = useState<AgentIdentityInfo[]>()
+  const [agentError, setAgentError] = useState<string>()
 
   const busy = Boolean(operationId)
   const locked = authFailures >= 3
@@ -92,6 +102,50 @@ export function ConnectionDialog({
   }, [operationId])
 
   useEffect(() => {
+    let disposed = false
+    let cleanup: (() => void) | undefined
+    void listenToAuthenticationPrompt((payload) => {
+      if (!disposed && payload.operationId === operationIdRef.current) {
+        setAuthenticationPrompt(payload)
+        setPromptAnswers(Object.fromEntries(payload.prompts.map((prompt) => [prompt.id, ''])))
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanup = unlisten
+    })
+    return () => {
+      disposed = true
+      cleanup?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!visible || draft.authType !== 'agent') return
+    let disposed = false
+    setAgentIdentities(undefined)
+    setAgentError(undefined)
+    void listSshAgentIdentities()
+      .then((identities) => { if (!disposed) setAgentIdentities(identities) })
+      .catch((error) => { if (!disposed) setAgentError(normalizeCommandError(error).message) })
+    return () => { disposed = true }
+  }, [visible, draft.authType])
+
+  useEffect(() => {
+    if (!authenticationPrompt) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        void cancelOperation(authenticationPrompt.operationId)
+        setAuthenticationPrompt(undefined)
+        setOperationId(undefined)
+        setProgress('')
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [authenticationPrompt])
+
+  useEffect(() => {
     if (visible) setDraft(suppliedDraft ?? initialConnectionDraft)
     if (!visible) {
       setDraft(initialConnectionDraft)
@@ -99,11 +153,16 @@ export function ConnectionDialog({
       setInspection(undefined)
       setIntent('connect')
       setOperationId(undefined)
+      operationIdRef.current = undefined
       setCommandError(undefined)
       setTestResult(undefined)
       setProgress('')
       setAuthFailures(0)
       setShowSecret(false)
+      setAuthenticationPrompt(undefined)
+      setPromptAnswers({})
+      setAgentIdentities(undefined)
+      setAgentError(undefined)
     }
   }, [visible, suppliedDraft])
 
@@ -133,6 +192,7 @@ export function ConnectionDialog({
 
     const nextOperationId = crypto.randomUUID()
     setIntent(nextIntent)
+    operationIdRef.current = nextOperationId
     setOperationId(nextOperationId)
     setProgress('正在连接服务器并获取指纹…')
     try {
@@ -146,6 +206,7 @@ export function ConnectionDialog({
     } catch (error) {
       handleError(error)
     } finally {
+      operationIdRef.current = undefined
       setOperationId(undefined)
     }
   }
@@ -161,6 +222,7 @@ export function ConnectionDialog({
       action,
     }
     setInspection(undefined)
+    operationIdRef.current = nextOperationId
     setOperationId(nextOperationId)
     setProgress(selectedIntent === 'test' ? '正在测试认证信息…' : '正在创建远程终端…')
     try {
@@ -181,6 +243,7 @@ export function ConnectionDialog({
     } catch (error) {
       handleError(error)
     } finally {
+      operationIdRef.current = undefined
       setOperationId(undefined)
     }
   }
@@ -189,16 +252,38 @@ export function ConnectionDialog({
     const normalized = normalizeCommandError(error)
     setCommandError(normalized)
     setProgress('')
-    if (normalized.code === 'AUTHENTICATION-FAILED') {
+    if (normalized.code === 'AUTHENTICATION-FAILED' || normalized.code.includes('REJECTED')) {
       setAuthFailures((count) => count + 1)
     }
   }
 
   const cancel = async () => {
     if (operationId) await cancelOperation(operationId)
+    operationIdRef.current = undefined
     setOperationId(undefined)
     setInspection(undefined)
     setProgress('')
+        setAuthenticationPrompt(undefined)
+        operationIdRef.current = undefined
+  }
+
+  const submitAuthenticationPrompt = async () => {
+    if (!authenticationPrompt) return
+    const response = {
+      operationId: authenticationPrompt.operationId,
+      promptId: authenticationPrompt.promptId,
+      answers: authenticationPrompt.prompts.map((prompt) => ({
+        id: prompt.id,
+        value: promptAnswers[prompt.id] ?? '',
+      })),
+    }
+    try {
+      await respondAuthenticationPrompt(response)
+      setAuthenticationPrompt(undefined)
+      setPromptAnswers({})
+    } catch (error) {
+      handleError(error)
+    }
   }
 
   const selectPrivateKey = async () => {
@@ -219,7 +304,7 @@ export function ConnectionDialog({
 
   const save = async () => {
     const nextErrors = validateConnectionDraft(draft, true)
-    if (draft.rememberCredential && !hasStoredCredential && !currentSecret(draft)) {
+    if ((draft.authType === 'password' || draft.authType === 'privateKey') && draft.rememberCredential && !hasStoredCredential && !currentSecret(draft)) {
       if (draft.authType === 'password') nextErrors.password = '请输入需要保存的密码'
       else nextErrors.privateKeyPassphrase = '请输入私钥口令，或取消记住口令'
     }
@@ -280,6 +365,8 @@ export function ConnectionDialog({
             <legend>认证方式</legend>
             <button className={draft.authType === 'password' ? 'active' : ''} type="button" onClick={() => update('authType', 'password')}>密码</button>
             <button className={draft.authType === 'privateKey' ? 'active' : ''} type="button" onClick={() => update('authType', 'privateKey')}>私钥</button>
+            <button className={draft.authType === 'keyboardInteractive' ? 'active' : ''} type="button" onClick={() => update('authType', 'keyboardInteractive')}>交互验证</button>
+            <button className={draft.authType === 'agent' ? 'active' : ''} type="button" onClick={() => update('authType', 'agent')}>SSH Agent</button>
           </fieldset>
 
           {draft.authType === 'password' ? (
@@ -289,7 +376,7 @@ export function ConnectionDialog({
                 <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? '隐藏' : '显示'}</button>
               </div>
             </Field>
-          ) : (
+          ) : draft.authType === 'privateKey' ? (
             <>
               <Field label="私钥文件" error={errors.privateKeyPath}>
                 <div className="path-input">
@@ -304,11 +391,32 @@ export function ConnectionDialog({
                 </div>
               </Field>
             </>
+          ) : draft.authType === 'keyboardInteractive' ? (
+            <div className="auth-method-note">
+              <Icon name="shield" />
+              <div><strong>由服务器动态询问</strong><span>适用于验证码、双因素认证和“每次询问”场景；回答只用于本次连接，不会保存。</span></div>
+            </div>
+          ) : (
+            <div className="agent-status" aria-live="polite">
+              <Icon name="key" />
+              <div>
+                <strong>Windows OpenSSH Agent</strong>
+                {agentError ? <span className="agent-error">{agentError}</span> : agentIdentities === undefined ? <span>正在检查 Agent…</span> : agentIdentities.length === 0 ? <span>Agent 已连接，但没有可用公钥。</span> : <span>已发现 {agentIdentities.length} 个可用公钥。</span>}
+                {agentIdentities && agentIdentities.length > 0 && (
+                  <select value={draft.agentKeyFingerprint} onChange={(event) => update('agentKeyFingerprint', event.target.value)} aria-label="首选 SSH Agent 密钥">
+                    <option value="">自动尝试全部密钥</option>
+                    {agentIdentities.map((identity) => <option key={identity.fingerprintSha256} value={identity.fingerprintSha256}>{identity.algorithm} · {identity.comment || identity.fingerprintSha256}</option>)}
+                  </select>
+                )}
+              </div>
+            </div>
           )}
-          <label className="remember-row">
-            <input type="checkbox" checked={draft.rememberCredential} onChange={(event) => update('rememberCredential', event.target.checked)} />
-            <span>{draft.authType === 'password' ? '记住密码' : '记住私钥口令'}（使用 Windows 凭据库）</span>
-          </label>
+          {(draft.authType === 'password' || draft.authType === 'privateKey') && (
+            <label className="remember-row">
+              <input type="checkbox" checked={draft.rememberCredential} onChange={(event) => update('rememberCredential', event.target.checked)} />
+              <span>{draft.authType === 'password' ? '记住密码' : '记住私钥口令'}（使用 Windows 凭据库）</span>
+            </label>
+          )}
           {onSave && (
             <Field label="备注" error={errors.note}>
               <textarea value={draft.note} onChange={(event) => update('note', event.target.value)} maxLength={500} rows={3} placeholder="用途、环境或维护信息" />
@@ -346,12 +454,43 @@ export function ConnectionDialog({
           onApprove={(action) => void execute(intent, inspection, action)}
         />
       )}
+      {authenticationPrompt && (
+        <div className="host-key-layer">
+          <section className="authentication-prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="authentication-prompt-title">
+            <span className="eyebrow">REMOTE AUTHENTICATION</span>
+            <h2 id="authentication-prompt-title">{authenticationPrompt.name || '服务器需要继续验证'}</h2>
+            <p className="authentication-target">{authenticationPrompt.connectionTitle} · {authenticationPrompt.target}</p>
+            {authenticationPrompt.instructions && <p>{authenticationPrompt.instructions}</p>}
+            <div className="authentication-prompt-fields">
+              {authenticationPrompt.prompts.map((prompt, index) => (
+                <Field key={prompt.id} label={prompt.text || `回答 ${index + 1}`}>
+                  <input
+                    autoFocus={index === 0}
+                    type={prompt.echo ? 'text' : 'password'}
+                    value={promptAnswers[prompt.id] ?? ''}
+                    onChange={(event) => setPromptAnswers((current) => ({ ...current, [prompt.id]: event.target.value }))}
+                    onKeyDown={(event) => { if (event.key === 'Enter') void submitAuthenticationPrompt() }}
+                  />
+                </Field>
+              ))}
+            </div>
+            <div className="host-key-actions">
+              <button className="secondary-button danger" type="button" onClick={() => void cancel()}>取消连接</button>
+              <button className="primary-button" type="button" onClick={() => void submitAuthenticationPrompt()}>提交回答</button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   )
 }
 
 function currentSecret(draft: ConnectionDraft): string | undefined {
-  const secret = draft.authType === 'password' ? draft.password : draft.privateKeyPassphrase
+  const secret = draft.authType === 'password'
+    ? draft.password
+    : draft.authType === 'privateKey'
+      ? draft.privateKeyPassphrase
+      : ''
   return secret || undefined
 }
 

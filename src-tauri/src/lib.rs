@@ -1,4 +1,5 @@
 mod assets;
+mod authentication;
 mod credentials;
 mod diagnostics;
 mod error;
@@ -11,10 +12,10 @@ mod ssh_client;
 use chrono::Utc;
 use error::AppError;
 use models::{
-    AssetTransferSummary, ConnectionAssetSnapshot, ConnectionGroup, ConnectionProfile,
-    ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, GroupNameRequest,
-    HealthResponse, HostKeyApproval, HostKeyInspection, KeepaliveSettings,
-    ReconnectSavedSessionRequest, RemoteDirectoryListing, SaveConnectionRequest,
+    AgentIdentityInfo, AssetTransferSummary, AuthenticationPromptResponse, ConnectionAssetSnapshot,
+    ConnectionGroup, ConnectionProfile, ConnectionProgressPayload, ConnectionRequest,
+    ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval, HostKeyInspection,
+    KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing, SaveConnectionRequest,
     SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
     TransferDirection, TransferTask, WindowState,
 };
@@ -453,7 +454,13 @@ async fn test_ssh_connection(
     let cancellation = operations.register(operation_id.clone())?;
     let known_hosts_path = known_hosts_path(&app)?;
     let result = tokio::select! {
-        result = ssh_client::test_connection(request, approval, known_hosts_path) => result,
+        result = ssh_client::test_connection(
+            app.clone(),
+            operation_id.clone(),
+            request,
+            approval,
+            known_hosts_path,
+        ) => result,
         _ = cancellation => Err(AppError::cancelled()),
     };
     operations.finish(&operation_id)?;
@@ -471,7 +478,7 @@ async fn connect_ssh(
     request: ConnectionRequest,
     approval: HostKeyApproval,
 ) -> Result<SessionState, AppError> {
-    let setup_timeout = time::Duration::from_secs(request.timeout_seconds);
+    let setup_timeout = connection_setup_timeout(&request);
     emit_progress(
         &app,
         &operation_id,
@@ -489,7 +496,13 @@ async fn connect_ssh(
     let result = tokio::select! {
         result = time::timeout(
             setup_timeout,
-            ssh_client::start_session(app.clone(), request, approval, known_hosts_path),
+            ssh_client::start_session(
+                app.clone(),
+                operation_id.clone(),
+                request,
+                approval,
+                known_hosts_path,
+            ),
         ) => result.map_err(|_| AppError::ssh(
             "CONNECTION-TIMEOUT",
             "连接超时，请检查主机、端口和防火墙",
@@ -551,7 +564,7 @@ async fn reconnect_ssh(
     request: ConnectionRequest,
     approval: HostKeyApproval,
 ) -> Result<SessionState, AppError> {
-    let setup_timeout = time::Duration::from_secs(request.timeout_seconds);
+    let setup_timeout = connection_setup_timeout(&request);
     emit_progress(
         &app,
         &operation_id,
@@ -565,6 +578,7 @@ async fn reconnect_ssh(
             setup_timeout,
             ssh_client::reconnect_session(
                 app.clone(),
+                operation_id.clone(),
                 request,
                 approval,
                 known_hosts_path,
@@ -618,11 +632,33 @@ fn apply_keepalive(request: &mut ConnectionRequest, settings: Option<KeepaliveSe
     }
 }
 
+fn connection_setup_timeout(request: &ConnectionRequest) -> time::Duration {
+    match request.auth_type {
+        models::AuthType::KeyboardInteractive => time::Duration::from_secs(150),
+        _ => time::Duration::from_secs(request.timeout_seconds),
+    }
+}
+
+#[tauri::command]
+fn respond_authentication_prompt(
+    broker: State<'_, authentication::AuthenticationBroker>,
+    response: AuthenticationPromptResponse,
+) -> Result<(), AppError> {
+    broker.respond(response)
+}
+
+#[tauri::command]
+async fn list_ssh_agent_identities() -> Result<Vec<AgentIdentityInfo>, AppError> {
+    ssh_client::list_agent_identities().await
+}
+
 #[tauri::command]
 fn cancel_operation(
     operations: State<'_, OperationRegistry>,
+    authentication: State<'_, authentication::AuthenticationBroker>,
     operation_id: String,
 ) -> Result<(), AppError> {
+    authentication.cancel_operation(&operation_id)?;
     operations.cancel(&operation_id)
 }
 
@@ -660,6 +696,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(SessionRegistry::default())
         .manage(OperationRegistry::default())
+        .manage(authentication::AuthenticationBroker::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -750,6 +787,8 @@ pub fn run() {
             connect_saved_connection,
             reconnect_ssh,
             reconnect_saved_connection,
+            respond_authentication_prompt,
+            list_ssh_agent_identities,
             cancel_operation,
         ])
         .build(tauri::generate_context!())

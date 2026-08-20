@@ -6,6 +6,7 @@ import {
   validateConnectionDraft,
   parseQuickTarget,
   filterConnections,
+  toSaveConnectionRequest,
 } from './types'
 
 describe('connection form', () => {
@@ -72,6 +73,24 @@ describe('connection form', () => {
       username: 'alice',
       authType: 'privateKey',
     })).toMatchObject({ privateKeyPath: expect.any(String) })
+  })
+
+  it.each(['keyboardInteractive', 'agent'] as const)('does not require a persisted secret for %s authentication', (authType) => {
+    const draft = {
+      ...initialConnectionDraft,
+      name: 'server',
+      host: 'server.example',
+      username: 'alice',
+      authType,
+      rememberCredential: true,
+    }
+    expect(validateConnectionDraft(draft)).toEqual({})
+    expect(toSaveConnectionRequest(draft)).toMatchObject({
+      authType,
+      rememberCredential: false,
+      secret: undefined,
+      privateKeyPath: undefined,
+    })
   })
 
   it('parses quick targets including bracketed IPv6', () => {

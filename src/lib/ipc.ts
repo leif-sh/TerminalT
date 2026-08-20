@@ -18,6 +18,9 @@ import type {
   SaveConnectionRequest,
   StoredHostKeyRecord,
   AssetTransferSummary,
+  AgentIdentityInfo,
+  AuthenticationPromptPayload,
+  AuthenticationPromptResponse,
 } from '../domain/connection/types'
 import type { TerminalSettings } from '../domain/terminal/settings'
 import type { RemoteDirectoryListing, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
@@ -45,6 +48,7 @@ type OutputHandler = (payload: SessionOutputPayload) => void
 type StatusHandler = (payload: SessionStatusPayload) => void
 type ProgressHandler = (payload: ConnectionProgressPayload) => void
 type TransferHandler = (payload: TransferProgressPayload) => void
+type AuthenticationPromptHandler = (payload: AuthenticationPromptPayload) => void
 
 const browserOutputHandlers = new Set<OutputHandler>()
 const browserStatusHandlers = new Set<StatusHandler>()
@@ -53,7 +57,7 @@ const previewAssetsKey = 'terminalt-preview-assets-v1'
 
 function emptyPreviewAssets(): ConnectionAssetSnapshot {
   const now = new Date().toISOString()
-  return { schemaVersion: 1, defaultGroupId: 'default', groups: [{ id: 'default', name: '默认分组', createdAt: now, updatedAt: now }], connections: [], recentTargets: [] }
+  return { schemaVersion: 2, defaultGroupId: 'default', groups: [{ id: 'default', name: '默认分组', createdAt: now, updatedAt: now }], connections: [], recentTargets: [] }
 }
 
 function readPreviewAssets(): ConnectionAssetSnapshot {
@@ -109,8 +113,9 @@ export async function saveConnectionProfile(request: SaveConnectionRequest): Pro
     const profile: ConnectionProfile = {
       id: request.id ?? crypto.randomUUID(), name: request.name, host: request.host, port: request.port,
       username: request.username, authType: request.authType,
-      credentialRef: request.rememberCredential ? `TerminalT/preview/${request.id ?? 'new'}` : undefined,
+      credentialRef: request.rememberCredential && ['password', 'privateKey'].includes(request.authType) ? `TerminalT/preview/${request.id ?? 'new'}` : undefined,
       privateKeyPath: request.privateKeyPath, groupId: request.groupId, note: request.note,
+      agentKeyFingerprint: request.agentKeyFingerprint,
       timeoutSeconds: request.timeoutSeconds, lastConnectedAt: existing?.lastConnectedAt,
       createdAt: existing?.createdAt ?? now, updatedAt: now,
     }
@@ -395,6 +400,7 @@ function toPreviewRequest(profile: ConnectionProfile, secret?: string): Connecti
     password: profile.authType === 'password' ? secret ?? 'preview-stored-secret' : '',
     privateKeyPath: profile.privateKeyPath ?? '',
     privateKeyPassphrase: profile.authType === 'privateKey' ? secret ?? '' : '',
+    agentKeyFingerprint: profile.agentKeyFingerprint,
     timeoutSeconds: profile.timeoutSeconds,
     keepaliveEnabled: true,
     keepaliveSeconds: 30,
@@ -406,6 +412,23 @@ function toPreviewRequest(profile: ConnectionProfile, secret?: string): Connecti
 export async function cancelOperation(operationId: string): Promise<void> {
   if (!isTauriRuntime()) return
   await invoke('cancel_operation', { operationId })
+}
+
+export async function listenToAuthenticationPrompt(handler: AuthenticationPromptHandler): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) return () => undefined
+  return listen<AuthenticationPromptPayload>('authentication-prompt', (event) => handler(event.payload))
+}
+
+export async function respondAuthenticationPrompt(response: AuthenticationPromptResponse): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('respond_authentication_prompt', { response })
+}
+
+export async function listSshAgentIdentities(): Promise<AgentIdentityInfo[]> {
+  if (!isTauriRuntime()) {
+    return [{ fingerprintSha256: 'SHA256:PREVIEW', algorithm: 'ssh-ed25519', comment: 'preview@example' }]
+  }
+  return invoke<AgentIdentityInfo[]>('list_ssh_agent_identities')
 }
 
 export async function listenToSessionOutput(handler: OutputHandler): Promise<UnlistenFn> {

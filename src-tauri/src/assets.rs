@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub const DEFAULT_GROUP_ID: &str = "default";
-const SCHEMA_VERSION: u16 = 1;
+const SCHEMA_VERSION: u16 = 2;
 const MAX_RECENT_TARGETS: usize = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,9 +111,9 @@ impl AssetStore {
         let created_at = existing
             .as_ref()
             .map_or_else(|| now.clone(), |item| item.created_at.clone());
-        let credential_ref = request
-            .remember_credential
-            .then(|| credential_reference(&id, request.auth_type));
+        let credential_ref = (request.remember_credential
+            && matches!(request.auth_type, AuthType::Password | AuthType::PrivateKey))
+        .then(|| credential_reference(&id, request.auth_type));
         let prior_ref = existing
             .as_ref()
             .and_then(|item| item.credential_ref.clone());
@@ -153,6 +153,9 @@ impl AssetStore {
             auth_type: request.auth_type,
             credential_ref: credential_ref.clone(),
             private_key_path: request.private_key_path.filter(|value| !value.is_empty()),
+            agent_key_fingerprint: request
+                .agent_key_fingerprint
+                .filter(|value| !value.is_empty()),
             group_id: request.group_id,
             note: request
                 .note
@@ -358,6 +361,7 @@ impl AssetStore {
                         .unwrap_or_default()
                 })
                 .filter(|value| !value.is_empty()),
+            agent_key_fingerprint: profile.agent_key_fingerprint.clone(),
             columns: 80,
             rows: 24,
             timeout_seconds: profile.timeout_seconds,
@@ -501,7 +505,9 @@ impl AssetStore {
                     AppError::asset_storage("无法读取待恢复的连接数据", error.to_string())
                 })?;
                 let document = parse_document(&pending)?;
-                if document_schema_version(&pending) == Some(0) {
+                if document_schema_version(&pending)
+                    .is_some_and(|version| version < SCHEMA_VERSION.into())
+                {
                     fs::write(
                         &temporary,
                         serde_json::to_vec_pretty(&document).map_err(|error| {
@@ -524,7 +530,9 @@ impl AssetStore {
         }
         match parse_document(&bytes) {
             Ok(document) => {
-                if document_schema_version(&bytes) == Some(0) {
+                if document_schema_version(&bytes)
+                    .is_some_and(|version| version < SCHEMA_VERSION.into())
+                {
                     let migrated = serde_json::to_vec_pretty(&document).map_err(|error| {
                         AppError::asset_storage("无法迁移连接数据", error.to_string())
                     })?;
@@ -541,7 +549,9 @@ impl AssetStore {
                     AppError::asset_storage("无法读取待恢复的连接数据", error.to_string())
                 })?;
                 let recovered = parse_document(&pending)?;
-                if document_schema_version(&pending) == Some(0) {
+                if document_schema_version(&pending)
+                    .is_some_and(|version| version < SCHEMA_VERSION.into())
+                {
                     fs::write(
                         &temporary,
                         serde_json::to_vec_pretty(&recovered).map_err(|error| {
@@ -619,7 +629,7 @@ fn parse_document(bytes: &[u8]) -> Result<AssetDocument, AppError> {
     })?;
     match document.schema_version {
         SCHEMA_VERSION => {}
-        0 => document.schema_version = SCHEMA_VERSION,
+        0 | 1 => document.schema_version = SCHEMA_VERSION,
         version => {
             return Err(AppError::asset_storage(
                 "连接数据版本暂不受支持",
@@ -835,6 +845,7 @@ mod tests {
             secret: Some("must-not-be-in-json".to_owned()),
             remember_credential: true,
             private_key_path: None,
+            agent_key_fingerprint: None,
             group_id: group_id.to_owned(),
             note: Some("primary server".to_owned()),
             timeout_seconds: 15,
@@ -969,22 +980,26 @@ mod tests {
     }
 
     #[test]
-    fn schema_zero_migrates_and_restores_the_default_group() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("connections.json");
-        std::fs::write(
-            &path,
-            br#"{"schemaVersion":0,"groups":[],"connections":[],"recentTargets":[]}"#,
-        )
-        .unwrap();
-        let store = AssetStore::new(path.clone(), std::sync::Arc::new(MemoryVault::default()));
-        let snapshot = store.snapshot().unwrap();
+    fn legacy_schemas_migrate_and_restore_the_default_group() {
+        for version in [0, 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("connections.json");
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"schemaVersion\":{version},\"groups\":[],\"connections\":[],\"recentTargets\":[]}}"
+                ),
+            )
+            .unwrap();
+            let store = AssetStore::new(path.clone(), std::sync::Arc::new(MemoryVault::default()));
+            let snapshot = store.snapshot().unwrap();
 
-        assert_eq!(snapshot.schema_version, 1);
-        assert_eq!(snapshot.groups[0].id, DEFAULT_GROUP_ID);
-        assert!(std::fs::read_to_string(path)
-            .unwrap()
-            .contains("\"schemaVersion\": 1"));
+            assert_eq!(snapshot.schema_version, 2);
+            assert_eq!(snapshot.groups[0].id, DEFAULT_GROUP_ID);
+            assert!(std::fs::read_to_string(path)
+                .unwrap()
+                .contains("\"schemaVersion\": 2"));
+        }
     }
 
     #[test]

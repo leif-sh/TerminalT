@@ -1,6 +1,28 @@
 import type { SessionStatus, TerminalSize } from '../session/types'
 
-export type AuthType = 'password' | 'privateKey'
+export type AuthType = 'password' | 'privateKey' | 'keyboardInteractive' | 'agent'
+
+export interface AuthenticationPromptPayload {
+  operationId: string
+  promptId: string
+  connectionTitle: string
+  target: string
+  name: string
+  instructions: string
+  prompts: Array<{ id: string; text: string; echo: boolean }>
+}
+
+export interface AuthenticationPromptResponse {
+  operationId: string
+  promptId: string
+  answers: Array<{ id: string; value: string }>
+}
+
+export interface AgentIdentityInfo {
+  fingerprintSha256: string
+  algorithm: string
+  comment: string
+}
 
 export interface ConnectionDraft {
   id?: string
@@ -12,6 +34,7 @@ export interface ConnectionDraft {
   password: string
   privateKeyPath: string
   privateKeyPassphrase: string
+  agentKeyFingerprint: string
   timeoutSeconds: number
   groupId: string
   note: string
@@ -27,6 +50,7 @@ export interface ConnectionRequest extends TerminalSize {
   password: string
   privateKeyPath: string
   privateKeyPassphrase: string
+  agentKeyFingerprint?: string
   timeoutSeconds: number
   keepaliveEnabled: boolean
   keepaliveSeconds: number
@@ -48,6 +72,7 @@ export interface ConnectionProfile {
   authType: AuthType
   credentialRef?: string
   privateKeyPath?: string
+  agentKeyFingerprint?: string
   groupId: string
   note?: string
   timeoutSeconds: number
@@ -96,6 +121,7 @@ export interface SaveConnectionRequest {
   secret?: string
   rememberCredential: boolean
   privateKeyPath?: string
+  agentKeyFingerprint?: string
   groupId: string
   note?: string
   timeoutSeconds: number
@@ -150,6 +176,7 @@ export const initialConnectionDraft: ConnectionDraft = {
   password: '',
   privateKeyPath: '',
   privateKeyPassphrase: '',
+  agentKeyFingerprint: '',
   timeoutSeconds: 15,
   groupId: 'default',
   note: '',
@@ -184,6 +211,7 @@ export function toConnectionRequest(
     password: draft.password,
     privateKeyPath: draft.privateKeyPath,
     privateKeyPassphrase: draft.privateKeyPassphrase,
+    agentKeyFingerprint: draft.authType === 'agent' ? draft.agentKeyFingerprint || undefined : undefined,
     timeoutSeconds: draft.timeoutSeconds,
     keepaliveEnabled: keepalive.enabled,
     keepaliveSeconds: keepalive.seconds,
@@ -201,6 +229,7 @@ export function draftFromProfile(profile: ConnectionProfile): ConnectionDraft {
     username: profile.username,
     authType: profile.authType,
     privateKeyPath: profile.privateKeyPath ?? '',
+    agentKeyFingerprint: profile.agentKeyFingerprint ?? '',
     groupId: profile.groupId,
     note: profile.note ?? '',
     timeoutSeconds: profile.timeoutSeconds,
@@ -216,9 +245,14 @@ export function toSaveConnectionRequest(draft: ConnectionDraft): SaveConnectionR
     port: draft.port,
     username: draft.username.trim(),
     authType: draft.authType,
-    secret: draft.authType === 'password' ? draft.password || undefined : draft.privateKeyPassphrase || undefined,
-    rememberCredential: draft.rememberCredential,
+    secret: draft.authType === 'password'
+      ? draft.password || undefined
+      : draft.authType === 'privateKey'
+        ? draft.privateKeyPassphrase || undefined
+        : undefined,
+    rememberCredential: ['password', 'privateKey'].includes(draft.authType) && draft.rememberCredential,
     privateKeyPath: draft.authType === 'privateKey' ? draft.privateKeyPath : undefined,
+    agentKeyFingerprint: draft.authType === 'agent' ? draft.agentKeyFingerprint || undefined : undefined,
     groupId: draft.groupId,
     note: draft.note.trim() || undefined,
     timeoutSeconds: draft.timeoutSeconds,

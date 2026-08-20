@@ -5,8 +5,8 @@ use std::{
 };
 
 use russh::{
-    client::{self},
-    keys::{load_secret_key, ssh_key, PrivateKeyWithHashAlg},
+    client::{self, KeyboardInteractiveAuthResponse},
+    keys::{agent::AgentIdentity, load_secret_key, ssh_key, PrivateKeyWithHashAlg},
     ChannelMsg, Disconnect,
 };
 use russh_sftp::{client::SftpSession, protocol::FileType};
@@ -21,7 +21,8 @@ use crate::{
     error::AppError,
     known_hosts::{HostKeyIdentity, KnownHostsStore},
     models::{
-        AuthType, ConnectionRequest, ConnectionTestResult, HostKeyApproval, HostKeyInspection,
+        AgentIdentityInfo, AuthType, AuthenticationPromptField, AuthenticationPromptPayload,
+        ConnectionRequest, ConnectionTestResult, HostKeyApproval, HostKeyInspection,
         RemoteDirectoryEntry, RemoteDirectoryListing, RemoteEntryKind, SessionOutputPayload,
         SessionState, SessionStatus, SessionStatusPayload, TransferDirection,
         TransferProgressPayload, TransferStatus, TransferTask,
@@ -32,6 +33,16 @@ use crate::{
 const SESSION_OUTPUT_EVENT: &str = "session-output";
 const SESSION_STATUS_EVENT: &str = "session-status";
 const TRANSFER_PROGRESS_EVENT: &str = "transfer-progress";
+const AUTHENTICATION_PROMPT_EVENT: &str = "authentication-prompt";
+const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_INTERACTIVE_ROUNDS: usize = 16;
+const MAX_INTERACTIVE_PROMPTS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct AuthenticationContext<'a> {
+    app: &'a AppHandle,
+    operation_id: &'a str,
+}
 
 #[derive(Clone)]
 struct ProbeHandler {
@@ -121,6 +132,8 @@ pub async fn inspect_host_key(
 }
 
 pub async fn test_connection(
+    app: AppHandle,
+    operation_id: String,
     mut request: ConnectionRequest,
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
@@ -129,10 +142,17 @@ pub async fn test_connection(
     let started_at = Instant::now();
     let host = request.host.clone();
     let port = request.port;
-    let timeout = Duration::from_secs(request.timeout_seconds);
+    let timeout = authentication_timeout(&request);
     let (handle, identity) = tokio::time::timeout(
         timeout,
-        connect_authenticated(&mut request, &approval.fingerprint_sha256),
+        connect_authenticated(
+            &mut request,
+            &approval.fingerprint_sha256,
+            Some(AuthenticationContext {
+                app: &app,
+                operation_id: &operation_id,
+            }),
+        ),
     )
     .await
     .map_err(|_| connection_timeout())??;
@@ -156,32 +176,43 @@ pub async fn test_connection(
 
 pub async fn start_session(
     app: AppHandle,
+    operation_id: String,
     request: ConnectionRequest,
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
 ) -> Result<SessionState, AppError> {
-    start_session_with_id(app, request, approval, known_hosts_path, None).await
+    start_session_with_id(app, operation_id, request, approval, known_hosts_path, None).await
 }
 
 pub async fn reconnect_session(
     app: AppHandle,
+    operation_id: String,
     request: ConnectionRequest,
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
     session_id: String,
 ) -> Result<SessionState, AppError> {
-    start_session_with_id(app, request, approval, known_hosts_path, Some(session_id)).await
+    start_session_with_id(
+        app,
+        operation_id,
+        request,
+        approval,
+        known_hosts_path,
+        Some(session_id),
+    )
+    .await
 }
 
 async fn start_session_with_id(
     app: AppHandle,
+    operation_id: String,
     mut request: ConnectionRequest,
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
     session_id: Option<String>,
 ) -> Result<SessionState, AppError> {
     request.validate().map_err(AppError::validation)?;
-    let timeout = Duration::from_secs(request.timeout_seconds);
+    let timeout = authentication_timeout(&request);
     let title = request.name.clone();
     let host = request.host.clone();
     let port = request.port;
@@ -189,7 +220,14 @@ async fn start_session_with_id(
     let rows = request.rows;
     let (handle, identity) = tokio::time::timeout(
         timeout,
-        connect_authenticated(&mut request, &approval.fingerprint_sha256),
+        connect_authenticated(
+            &mut request,
+            &approval.fingerprint_sha256,
+            Some(AuthenticationContext {
+                app: &app,
+                operation_id: &operation_id,
+            }),
+        ),
     )
     .await
     .map_err(|_| connection_timeout())??;
@@ -238,6 +276,7 @@ async fn start_session_with_id(
 async fn connect_authenticated(
     request: &mut ConnectionRequest,
     expected_fingerprint: &str,
+    authentication_context: Option<AuthenticationContext<'_>>,
 ) -> Result<(client::Handle<VerifiedHandler>, HostKeyIdentity), AppError> {
     let captured_key = Arc::new(Mutex::new(None));
     let handler = VerifiedHandler {
@@ -329,6 +368,17 @@ async fn connect_authenticated(
                 .await
                 .map_err(map_russh_error)?
         }
+        AuthType::KeyboardInteractive => {
+            authenticate_keyboard_interactive(&mut handle, request, authentication_context).await?
+        }
+        AuthType::Agent => {
+            authenticate_with_agent(
+                &mut handle,
+                &request.username,
+                request.agent_key_fingerprint.as_deref(),
+            )
+            .await?
+        }
     };
 
     if !authentication.success() {
@@ -342,6 +392,229 @@ async fn connect_authenticated(
     }
 
     Ok((handle, identity))
+}
+
+fn authentication_timeout(request: &ConnectionRequest) -> Duration {
+    match request.auth_type {
+        AuthType::KeyboardInteractive => INTERACTIVE_AUTH_TIMEOUT + Duration::from_secs(30),
+        _ => Duration::from_secs(request.timeout_seconds),
+    }
+}
+
+async fn authenticate_keyboard_interactive(
+    handle: &mut client::Handle<VerifiedHandler>,
+    request: &ConnectionRequest,
+    context: Option<AuthenticationContext<'_>>,
+) -> Result<russh::client::AuthResult, AppError> {
+    let context = context.ok_or_else(|| {
+        AppError::ssh(
+            "AUTH-INTERACTIVE-UNAVAILABLE",
+            "当前环境无法显示服务器认证请求",
+            "keyboard-interactive authentication requires an application event context",
+            false,
+        )
+    })?;
+    let mut response = handle
+        .authenticate_keyboard_interactive_start(request.username.clone(), None)
+        .await
+        .map_err(map_russh_error)?;
+
+    for _ in 0..MAX_INTERACTIVE_ROUNDS {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => {
+                return Ok(russh::client::AuthResult::Success)
+            }
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
+                return Err(AppError::ssh(
+                    "AUTH-INTERACTIVE-REJECTED",
+                    "服务器拒绝了交互式认证",
+                    "keyboard-interactive authentication was rejected",
+                    true,
+                ))
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                if prompts.len() > MAX_INTERACTIVE_PROMPTS {
+                    return Err(AppError::ssh(
+                        "AUTH-INTERACTIVE-LIMIT",
+                        "服务器返回的认证问题过多",
+                        format!("received {} prompts in one round", prompts.len()),
+                        false,
+                    ));
+                }
+                let answer_ids = (0..prompts.len())
+                    .map(|index| format!("answer-{index}"))
+                    .collect::<Vec<_>>();
+                let broker = context
+                    .app
+                    .state::<crate::authentication::AuthenticationBroker>();
+                let pending = broker.register(context.operation_id, answer_ids.clone())?;
+                let payload = AuthenticationPromptPayload {
+                    operation_id: context.operation_id.to_owned(),
+                    prompt_id: pending.prompt_id().to_owned(),
+                    connection_title: request.name.clone(),
+                    target: format!("{}@{}:{}", request.username, request.host, request.port),
+                    name,
+                    instructions,
+                    prompts: prompts
+                        .into_iter()
+                        .zip(answer_ids)
+                        .map(|(prompt, id)| AuthenticationPromptField {
+                            id,
+                            text: prompt.prompt,
+                            echo: prompt.echo,
+                        })
+                        .collect(),
+                };
+                context
+                    .app
+                    .emit(AUTHENTICATION_PROMPT_EVENT, payload)
+                    .map_err(|error| {
+                        AppError::event_delivery_failed(AUTHENTICATION_PROMPT_EVENT, error)
+                    })?;
+                let answers = tokio::time::timeout(INTERACTIVE_AUTH_TIMEOUT, pending.wait())
+                    .await
+                    .map_err(|_| {
+                        AppError::ssh(
+                            "AUTH-INTERACTIVE-TIMEOUT",
+                            "等待认证输入超时，请重新连接",
+                            "keyboard-interactive prompt timed out",
+                            true,
+                        )
+                    })??;
+                response = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(map_russh_error)?;
+            }
+        }
+    }
+    Err(AppError::ssh(
+        "AUTH-INTERACTIVE-LIMIT",
+        "服务器认证轮次过多，连接已停止",
+        "keyboard-interactive authentication exceeded the round limit",
+        false,
+    ))
+}
+
+async fn authenticate_with_agent(
+    handle: &mut client::Handle<VerifiedHandler>,
+    username: &str,
+    preferred_fingerprint: Option<&str>,
+) -> Result<russh::client::AuthResult, AppError> {
+    let mut agent = connect_system_agent().await?;
+    let identities = agent.request_identities().await.map_err(map_agent_error)?;
+    let mut identities = identities
+        .into_iter()
+        .filter_map(|identity| match identity {
+            AgentIdentity::PublicKey { key, comment } => Some((key, comment)),
+            AgentIdentity::Certificate { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(preferred) = preferred_fingerprint {
+        identities.sort_by_key(|(key, _)| {
+            key.fingerprint(russh::keys::HashAlg::Sha256).to_string() != preferred
+        });
+    }
+    let hash_algorithm = handle
+        .best_supported_rsa_hash()
+        .await
+        .map_err(map_russh_error)?
+        .flatten();
+    let mut attempted = false;
+    for (key, _) in identities {
+        attempted = true;
+        let result = handle
+            .authenticate_publickey_with(username.to_owned(), key, hash_algorithm, &mut agent)
+            .await
+            .map_err(|error| {
+                AppError::ssh(
+                    "AUTH-AGENT-SIGN-FAILED",
+                    "SSH Agent 未能完成签名",
+                    error.to_string(),
+                    true,
+                )
+            })?;
+        if result.success() {
+            return Ok(result);
+        }
+    }
+    Err(AppError::ssh(
+        if attempted {
+            "AUTH-AGENT-REJECTED"
+        } else {
+            "AUTH-AGENT-NO-KEYS"
+        },
+        if attempted {
+            "服务器未接受 SSH Agent 中的密钥"
+        } else {
+            "SSH Agent 中没有可用密钥"
+        },
+        "no plain SSH agent identity authenticated successfully",
+        true,
+    ))
+}
+
+pub async fn list_agent_identities() -> Result<Vec<AgentIdentityInfo>, AppError> {
+    let mut agent = connect_system_agent().await?;
+    let identities = agent.request_identities().await.map_err(map_agent_error)?;
+    Ok(identities
+        .into_iter()
+        .filter_map(|identity| match identity {
+            AgentIdentity::PublicKey { key, comment } => Some(AgentIdentityInfo {
+                fingerprint_sha256: key.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+                algorithm: key.algorithm().to_string(),
+                comment,
+            }),
+            AgentIdentity::Certificate { .. } => None,
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+async fn connect_system_agent() -> Result<
+    russh::keys::agent::client::AgentClient<
+        Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>,
+    >,
+    AppError,
+> {
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        russh::keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent"),
+    )
+    .await
+    .map_err(|_| agent_unavailable("SSH agent named-pipe connection timed out".to_owned()))?
+    .map(|agent| agent.dynamic())
+    .map_err(map_agent_error)
+}
+
+#[cfg(unix)]
+async fn connect_system_agent() -> Result<
+    russh::keys::agent::client::AgentClient<
+        Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>,
+    >,
+    AppError,
+> {
+    russh::keys::agent::client::AgentClient::connect_env()
+        .await
+        .map(|agent| agent.dynamic())
+        .map_err(map_agent_error)
+}
+
+fn map_agent_error(error: russh::keys::Error) -> AppError {
+    agent_unavailable(error.to_string())
+}
+
+fn agent_unavailable(details: String) -> AppError {
+    AppError::ssh(
+        "AUTH-AGENT-UNAVAILABLE",
+        "无法连接系统 SSH Agent，请确认 OpenSSH Authentication Agent 服务已启动",
+        details,
+        true,
+    )
 }
 
 async fn run_session(
@@ -1339,16 +1612,17 @@ fn map_private_key_error(error: russh::keys::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
     use russh::{
+        client::{self, KeyboardInteractiveAuthResponse},
         keys::{ssh_key, Algorithm, EcdsaCurve, HashAlg, PrivateKey},
-        server::{self, Auth, Msg, Server as _, Session},
+        server::{self, Auth, Msg, Response, Server as _, Session},
         Channel, ChannelId,
     };
     use tokio::sync::Mutex;
 
-    use super::{connect_authenticated, inspect_host_key};
+    use super::{client_config, connect_authenticated, inspect_host_key, ProbeHandler};
     use crate::{
         known_hosts::KnownHostsStore,
         models::{AuthType, ConnectionRequest, HostKeyStatus},
@@ -1398,6 +1672,29 @@ mod tests {
             } else {
                 Auth::reject()
             })
+        }
+
+        async fn auth_keyboard_interactive<'a>(
+            &'a mut self,
+            user: &str,
+            _: &str,
+            response: Option<Response<'a>>,
+        ) -> Result<Auth, Self::Error> {
+            if user != "terminalt" {
+                return Ok(Auth::reject());
+            }
+            match response {
+                None => Ok(Auth::Partial {
+                    name: Cow::Borrowed("Two-factor authentication"),
+                    instructions: Cow::Borrowed("Enter the current one-time code"),
+                    prompts: Cow::Owned(vec![(Cow::Borrowed("Verification code:"), false)]),
+                }),
+                Some(mut responses) => Ok(if responses.next().as_deref() == Some(b"654321") {
+                    Auth::Accept
+                } else {
+                    Auth::reject()
+                }),
+            }
         }
 
         async fn channel_open_session(
@@ -1491,6 +1788,7 @@ mod tests {
             password: Some("test-secret".to_owned()),
             private_key_path: None,
             private_key_passphrase: None,
+            agent_key_fingerprint: None,
             columns: 100,
             rows: 30,
             timeout_seconds: 5,
@@ -1503,7 +1801,7 @@ mod tests {
     async fn password_authentication_opens_pty_shell() {
         let (address, fingerprint, server) = start_server().await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let mut channel = handle.channel_open_session().await.unwrap();
@@ -1530,13 +1828,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyboard_interactive_loopback_supports_hidden_one_time_code() {
+        let (address, _, server) = start_server().await;
+        let captured_key = Arc::new(std::sync::Mutex::new(None));
+        let mut handle = client::connect(
+            Arc::new(client_config(None)),
+            address,
+            ProbeHandler { captured_key },
+        )
+        .await
+        .unwrap();
+        let response = handle
+            .authenticate_keyboard_interactive_start("terminalt", None)
+            .await
+            .unwrap();
+        match response {
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                assert_eq!(prompts.len(), 1);
+                assert!(!prompts[0].echo);
+            }
+            other => panic!("expected info request, got {other:?}"),
+        }
+        let response = handle
+            .authenticate_keyboard_interactive_respond(vec!["654321".to_owned()])
+            .await
+            .unwrap();
+        assert!(matches!(response, KeyboardInteractiveAuthResponse::Success));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn ten_sessions_remain_isolated_when_another_authentication_fails() {
         let (address, fingerprint, server) = start_server().await;
         let mut handles = Vec::new();
         for index in 0..10 {
             let mut connection = request(address, AuthType::Password);
             connection.name = format!("session-{index}");
-            let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
                 .await
                 .unwrap();
             handles.push(handle);
@@ -1544,7 +1872,7 @@ mod tests {
 
         let mut rejected = request(address, AuthType::Password);
         rejected.password = Some("incorrect".to_owned());
-        let error = match connect_authenticated(&mut rejected, &fingerprint).await {
+        let error = match connect_authenticated(&mut rejected, &fingerprint, None).await {
             Ok(_) => panic!("incorrect password unexpectedly authenticated"),
             Err(error) => error,
         };
@@ -1597,7 +1925,7 @@ mod tests {
         let startup_output = vec![b'L'; OUTPUT_SIZE];
         let (address, fingerprint, server) = start_server_with_output(startup_output).await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let channel = handle.channel_open_session().await.unwrap();
@@ -1658,7 +1986,7 @@ mod tests {
         .to_vec();
         let (address, fingerprint, server) = start_server_with_output(expected.clone()).await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let mut channel = handle.channel_open_session().await.unwrap();
@@ -1705,7 +2033,7 @@ mod tests {
         connection.password = None;
         connection.private_key_path = Some(key_path.to_string_lossy().into_owned());
 
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         handle
@@ -1748,7 +2076,7 @@ mod tests {
             connection.password = None;
             connection.private_key_path = Some(path.to_string_lossy().into_owned());
             connection.private_key_passphrase = passphrase;
-            let (handle, _) = connect_authenticated(&mut connection, &fingerprint)
+            let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
                 .await
                 .unwrap();
             handle
@@ -1764,7 +2092,7 @@ mod tests {
         let (address, fingerprint, server) = start_server().await;
         let mut connection = request(address, AuthType::Password);
         connection.password = Some("must-not-appear".to_owned());
-        let error = match connect_authenticated(&mut connection, &fingerprint).await {
+        let error = match connect_authenticated(&mut connection, &fingerprint, None).await {
             Ok(_) => panic!("incorrect password unexpectedly authenticated"),
             Err(error) => error,
         };

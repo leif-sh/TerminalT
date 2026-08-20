@@ -29,7 +29,7 @@ Windows 官方 `CredWriteW` 语义允许同一目标名创建或替换当前用�
 
 ## 3. 持久化策略
 
-当前 schema 版本为 `1`，默认分组内部 ID 固定为 `default`。写入步骤为：
+当前 schema 版本为 `2`，默认分组内部 ID 固定为 `default`。schema 2 增加交互认证、SSH Agent 与可选首选公钥指纹；schema 0、1 会在读取时单向迁移。写入步骤为：
 
 1. 将完整新文档序列化到同目录的 `connections.json.new`；
 2. 首次写入使用同卷 rename；

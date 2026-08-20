@@ -122,6 +122,8 @@ pub struct ConnectionRequest {
     pub password: Option<String>,
     pub private_key_path: Option<String>,
     pub private_key_passphrase: Option<String>,
+    #[serde(default)]
+    pub agent_key_fingerprint: Option<String>,
     pub columns: u16,
     pub rows: u16,
     pub timeout_seconds: u64,
@@ -185,6 +187,51 @@ fn default_keepalive_seconds() -> u64 {
 pub enum AuthType {
     Password,
     PrivateKey,
+    KeyboardInteractive,
+    Agent,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationPromptPayload {
+    pub operation_id: String,
+    pub prompt_id: String,
+    pub connection_title: String,
+    pub target: String,
+    pub name: String,
+    pub instructions: String,
+    pub prompts: Vec<AuthenticationPromptField>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationPromptField {
+    pub id: String,
+    pub text: String,
+    pub echo: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationPromptResponse {
+    pub operation_id: String,
+    pub prompt_id: String,
+    pub answers: Vec<AuthenticationPromptAnswer>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationPromptAnswer {
+    pub id: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIdentityInfo {
+    pub fingerprint_sha256: String,
+    pub algorithm: String,
+    pub comment: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -207,6 +254,8 @@ pub struct ConnectionProfile {
     pub auth_type: AuthType,
     pub credential_ref: Option<String>,
     pub private_key_path: Option<String>,
+    #[serde(default)]
+    pub agent_key_fingerprint: Option<String>,
     pub group_id: String,
     pub note: Option<String>,
     pub timeout_seconds: u64,
@@ -227,6 +276,7 @@ pub struct SaveConnectionRequest {
     pub secret: Option<String>,
     pub remember_credential: bool,
     pub private_key_path: Option<String>,
+    pub agent_key_fingerprint: Option<String>,
     pub group_id: String,
     pub note: Option<String>,
     pub timeout_seconds: u64,
@@ -365,6 +415,7 @@ mod tests {
             password: Some("secret".to_owned()),
             private_key_path: None,
             private_key_passphrase: None,
+            agent_key_fingerprint: None,
             columns: 80,
             rows: 24,
             timeout_seconds: 15,

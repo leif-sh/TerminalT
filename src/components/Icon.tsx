@@ -11,6 +11,7 @@ export type IconName =
   | 'folder'
   | 'close'
   | 'chevron'
+  | 'key'
 
 const paths: Record<IconName, ReactNode> = {
   connection: <><path d="M9.5 14.5l5-5"/><path d="M7 17a3 3 0 010-4.24l2-2a3 3 0 014.24 0"/><path d="M17 7a3 3 0 010 4.24l-2 2a3 3 0 01-4.24 0"/></>,
@@ -23,6 +24,7 @@ const paths: Record<IconName, ReactNode> = {
   folder: <path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2h8.5A1.5 1.5 0 0121 8.5v9a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5v-11z"/>,
   close: <path d="M7 7l10 10M17 7L7 17"/>,
   chevron: <path d="M9 18l6-6-6-6"/>,
+  key: <><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M15 8l2 2M17 6l2 2"/></>,
 }
 
 export function Icon({ name, ...props }: SVGProps<SVGSVGElement> & { name: IconName }) {
