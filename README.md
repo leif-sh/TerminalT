@@ -40,6 +40,7 @@ npm run release:audit
 
 ## 产品与开发文档
 
+- [总体开发文档](./docs/TERMINALT_OVERALL_DEVELOPMENT_PLAN.md)
 - [基础版功能开发文档](./docs/SSH_CLIENT_BASIC_VERSION.md)
 - [阶段开发文档总览](./docs/development-stages/README.md)
 - [阶段 0 架构说明](./docs/architecture/STAGE_0_FOUNDATION.md)
