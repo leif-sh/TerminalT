@@ -24,6 +24,7 @@ import type {
 } from '../domain/connection/types'
 import type { TerminalSettings } from '../domain/terminal/settings'
 import type { RemoteDirectoryListing, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
+import type { SaveTunnelRequest, TunnelProfile, TunnelRuntimeState, TunnelStatusPayload } from '../domain/tunnel/types'
 
 export interface HealthResponse {
   status: 'ok'
@@ -53,11 +54,12 @@ type AuthenticationPromptHandler = (payload: AuthenticationPromptPayload) => voi
 const browserOutputHandlers = new Set<OutputHandler>()
 const browserStatusHandlers = new Set<StatusHandler>()
 const browserProgressHandlers = new Set<ProgressHandler>()
+const browserTunnelHandlers = new Set<(payload: TunnelStatusPayload) => void>()
 const previewAssetsKey = 'terminalt-preview-assets-v1'
 
 function emptyPreviewAssets(): ConnectionAssetSnapshot {
   const now = new Date().toISOString()
-  return { schemaVersion: 2, defaultGroupId: 'default', groups: [{ id: 'default', name: '默认分组', createdAt: now, updatedAt: now }], connections: [], recentTargets: [] }
+  return { schemaVersion: 3, defaultGroupId: 'default', groups: [{ id: 'default', name: '默认分组', createdAt: now, updatedAt: now }], connections: [], recentTargets: [], tunnels: [] }
 }
 
 function readPreviewAssets(): ConnectionAssetSnapshot {
@@ -116,6 +118,14 @@ export async function saveConnectionProfile(request: SaveConnectionRequest): Pro
       credentialRef: request.rememberCredential && ['password', 'privateKey'].includes(request.authType) ? `TerminalT/preview/${request.id ?? 'new'}` : undefined,
       privateKeyPath: request.privateKeyPath, groupId: request.groupId, note: request.note,
       agentKeyFingerprint: request.agentKeyFingerprint,
+      proxy: request.proxy ? {
+        proxyType: request.proxy.proxyType,
+        host: request.proxy.host,
+        port: request.proxy.port,
+        username: request.proxy.username,
+        credentialRef: request.proxy.rememberCredential ? `TerminalT/preview/${request.id ?? 'new'}/proxy` : undefined,
+      } : undefined,
+      jumpHostIds: request.jumpHostIds,
       timeoutSeconds: request.timeoutSeconds, lastConnectedAt: existing?.lastConnectedAt,
       createdAt: existing?.createdAt ?? now, updatedAt: now,
     }
@@ -146,6 +156,48 @@ export async function deleteConnectionProfile(connectionId: string): Promise<voi
     const assets = readPreviewAssets(); assets.connections = assets.connections.filter((item) => item.id !== connectionId); writePreviewAssets(assets); return
   }
   await invoke('delete_connection_profile', { connectionId })
+}
+
+export async function saveTunnelProfile(request: SaveTunnelRequest): Promise<TunnelProfile> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); const now = new Date().toISOString()
+    const existing = assets.tunnels?.find((item) => item.id === request.id)
+    const profile: TunnelProfile = { ...request, id: request.id ?? crypto.randomUUID(), createdAt: existing?.createdAt ?? now, updatedAt: now }
+    delete (profile as TunnelProfile & { allowNonLoopback?: boolean }).allowNonLoopback
+    assets.tunnels = [...(assets.tunnels ?? []).filter((item) => item.id !== profile.id), profile]
+    writePreviewAssets(assets); return profile
+  }
+  return invoke<TunnelProfile>('save_tunnel_profile', { request })
+}
+
+export async function deleteTunnelProfile(tunnelId: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); assets.tunnels = (assets.tunnels ?? []).filter((item) => item.id !== tunnelId); writePreviewAssets(assets); return
+  }
+  await invoke('delete_tunnel_profile', { tunnelId })
+}
+
+export async function listRuntimeTunnels(): Promise<TunnelRuntimeState[]> {
+  if (!isTauriRuntime()) return []
+  return invoke<TunnelRuntimeState[]>('list_runtime_tunnels')
+}
+
+export async function startTunnel(sessionId: string, tunnelId: string): Promise<TunnelRuntimeState> {
+  if (!isTauriRuntime()) {
+    const state: TunnelRuntimeState = { runtimeId: crypto.randomUUID(), profileId: tunnelId, sessionId, status: 'running', boundPort: 0, activeConnections: 0, bytesUp: 0, bytesDown: 0 }
+    browserTunnelHandlers.forEach((handler) => handler({ tunnel: state })); return state
+  }
+  return invoke<TunnelRuntimeState>('start_tunnel', { sessionId, tunnelId })
+}
+
+export async function stopTunnel(runtimeId: string): Promise<TunnelRuntimeState> {
+  if (!isTauriRuntime()) throw new Error('浏览器预览中没有持久运行的隧道')
+  return invoke<TunnelRuntimeState>('stop_tunnel', { runtimeId })
+}
+
+export async function onTunnelStatus(handler: (payload: TunnelStatusPayload) => void): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) { browserTunnelHandlers.add(handler); return () => browserTunnelHandlers.delete(handler) }
+  return listen<TunnelStatusPayload>('tunnel-status', ({ payload }) => handler(payload))
 }
 
 export async function saveConnectionGroup(name: string, id?: string): Promise<ConnectionGroup> {
@@ -255,7 +307,7 @@ export async function closeMockSession(sessionId: string): Promise<void> {
 
 export async function inspectSshHostKey(
   operationId: string,
-  request: Pick<ConnectionRequest, 'host' | 'port' | 'timeoutSeconds'>,
+  request: Pick<ConnectionRequest, 'host' | 'port' | 'timeoutSeconds' | 'proxy'>,
 ): Promise<HostKeyInspection> {
   if (!isTauriRuntime()) {
     browserProgressHandlers.forEach((handler) => handler({
@@ -277,6 +329,7 @@ export async function inspectSshHostKey(
     host: request.host,
     port: request.port,
     timeoutSeconds: request.timeoutSeconds,
+    proxy: request.proxy,
   })
 }
 
@@ -401,6 +454,13 @@ function toPreviewRequest(profile: ConnectionProfile, secret?: string): Connecti
     privateKeyPath: profile.privateKeyPath ?? '',
     privateKeyPassphrase: profile.authType === 'privateKey' ? secret ?? '' : '',
     agentKeyFingerprint: profile.agentKeyFingerprint,
+    proxy: profile.proxy ? {
+      proxyType: profile.proxy.proxyType,
+      host: profile.proxy.host,
+      port: profile.proxy.port,
+      username: profile.proxy.username,
+      password: undefined,
+    } : undefined,
     timeoutSeconds: profile.timeoutSeconds,
     keepaliveEnabled: true,
     keepaliveSeconds: 30,

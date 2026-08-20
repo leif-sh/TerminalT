@@ -6,6 +6,7 @@ import { TerminalView } from './features/terminal/TerminalView'
 import { SftpPanel } from './features/sftp/SftpPanel'
 import { useSessionController } from './features/sessions/useSessionController'
 import { ConnectionDialog } from './features/connections/ConnectionDialog'
+import { TunnelsView } from './features/tunnels/TunnelsView'
 import type { ConnectionAssetSnapshot, ConnectionDraft, ConnectionProfile, ConnectionRequest, HostKeyApproval, SaveConnectionRequest } from './domain/connection/types'
 import { draftFromProfile, filterConnections, initialConnectionDraft, parseQuickTarget, toReconnectDraft } from './domain/connection/types'
 import {
@@ -19,7 +20,7 @@ import { t } from './lib/i18n'
 import type { TerminalSettings } from './domain/terminal/settings'
 import { normalizeTerminalSettings } from './domain/terminal/settings'
 
-type View = 'connections' | 'settings'
+type View = 'connections' | 'tunnels' | 'settings'
 
 function App() {
   const [view, setView] = useState<View>('connections')
@@ -183,6 +184,15 @@ function App() {
             {t('connections')}
           </button>
           <button
+            className={view === 'tunnels' ? 'nav-item active' : 'nav-item'}
+            type="button"
+            onClick={() => setView('tunnels')}
+            aria-current={view === 'tunnels' ? 'page' : undefined}
+          >
+            <Icon name="tunnel" />
+            隧道
+          </button>
+          <button
             className={view === 'settings' ? 'nav-item active' : 'nav-item'}
             type="button"
             onClick={() => setView('settings')}
@@ -241,6 +251,8 @@ function App() {
               onReconnectSession={openReconnect}
             />
           </>
+        ) : view === 'tunnels' ? (
+          <TunnelsView assets={assets} sessions={sessions} onAssetsChanged={refreshAssets} />
         ) : (
           <SettingsView settings={terminalSettings} assets={assets} error={settingsError} onAssetsChanged={refreshAssets} onChange={(value) => void updateSettings(value)} />
         )}
@@ -254,6 +266,7 @@ function App() {
         }}
         initialDraft={dialogDraft}
         groups={assets?.groups}
+        connections={assets?.connections}
         onClose={closeConnectionDialog}
         onSave={quickSource || reconnectTarget ? undefined : async (request: SaveConnectionRequest) => { await saveConnectionProfile(request); await refreshAssets() }}
         onConnect={async (

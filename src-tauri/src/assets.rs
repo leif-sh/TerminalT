@@ -14,11 +14,12 @@ use crate::{
     models::{
         AssetTransferSummary, AuthType, ConnectionAssetSnapshot, ConnectionGroup,
         ConnectionProfile, GroupNameRequest, RecentTarget, SaveConnectionRequest,
+        SaveTunnelRequest, TunnelKind, TunnelProfile,
     },
 };
 
 pub const DEFAULT_GROUP_ID: &str = "default";
-const SCHEMA_VERSION: u16 = 2;
+const SCHEMA_VERSION: u16 = 3;
 const MAX_RECENT_TARGETS: usize = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,6 +29,8 @@ struct AssetDocument {
     groups: Vec<ConnectionGroup>,
     connections: Vec<ConnectionProfile>,
     recent_targets: Vec<RecentTarget>,
+    #[serde(default)]
+    tunnels: Vec<TunnelProfile>,
 }
 
 impl Default for AssetDocument {
@@ -43,6 +46,7 @@ impl Default for AssetDocument {
             }],
             connections: Vec::new(),
             recent_targets: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
 }
@@ -77,6 +81,7 @@ impl AssetStore {
             groups: document.groups,
             connections: document.connections,
             recent_targets: document.recent_targets,
+            tunnels: document.tunnels,
         })
     }
 
@@ -108,6 +113,7 @@ impl AssetStore {
         if request.id.is_some() && existing.is_none() {
             return Err(AppError::asset_not_found("connection", &id));
         }
+        validate_jump_hosts(&document.connections, &id, &request.jump_host_ids)?;
         let created_at = existing
             .as_ref()
             .map_or_else(|| now.clone(), |item| item.created_at.clone());
@@ -118,6 +124,20 @@ impl AssetStore {
             .as_ref()
             .and_then(|item| item.credential_ref.clone());
         let prior_secret = prior_ref
+            .as_deref()
+            .map(|reference| self.vault.get(reference))
+            .transpose()?
+            .flatten();
+        let proxy_credential_ref = request
+            .proxy
+            .as_ref()
+            .filter(|proxy| proxy.remember_credential && proxy.username.is_some())
+            .map(|_| proxy_credential_reference(&id));
+        let prior_proxy_ref = existing
+            .as_ref()
+            .and_then(|item| item.proxy.as_ref())
+            .and_then(|proxy| proxy.credential_ref.clone());
+        let prior_proxy_secret = prior_proxy_ref
             .as_deref()
             .map(|reference| self.vault.get(reference))
             .transpose()?
@@ -144,6 +164,30 @@ impl AssetStore {
             }
         }
 
+        if let Some(reference) = proxy_credential_ref.as_deref() {
+            if let Some(password) = request
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.password.as_deref())
+                .filter(|password| !password.is_empty())
+            {
+                self.vault.set(reference, password)?;
+            } else if prior_proxy_ref.as_deref() != Some(reference) {
+                rollback_credential(
+                    self.vault.as_ref(),
+                    credential_ref.as_deref(),
+                    prior_ref.as_deref(),
+                    prior_secret.as_deref().map(String::as_str),
+                );
+                return Err(AppError::credential(
+                    "PROXY-CREDENTIAL-REQUIRED",
+                    "请输入需要保存的代理密码",
+                    "proxy credential storage requested without a password",
+                    false,
+                ));
+            }
+        }
+
         let profile = ConnectionProfile {
             id: id.clone(),
             name: request.name.trim().to_owned(),
@@ -156,6 +200,17 @@ impl AssetStore {
             agent_key_fingerprint: request
                 .agent_key_fingerprint
                 .filter(|value| !value.is_empty()),
+            proxy: request.proxy.map(|proxy| crate::models::ProxyProfile {
+                proxy_type: proxy.proxy_type,
+                host: proxy.host.trim().to_owned(),
+                port: proxy.port,
+                username: proxy
+                    .username
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty()),
+                credential_ref: proxy_credential_ref.clone(),
+            }),
+            jump_host_ids: request.jump_host_ids,
             group_id: request.group_id,
             note: request
                 .note
@@ -181,6 +236,25 @@ impl AssetStore {
                 }
             }
         }
+        if prior_proxy_ref != proxy_credential_ref {
+            if let Some(reference) = prior_proxy_ref.as_deref() {
+                if let Err(error) = self.vault.delete(reference) {
+                    rollback_credential(
+                        self.vault.as_ref(),
+                        credential_ref.as_deref(),
+                        prior_ref.as_deref(),
+                        prior_secret.as_deref().map(String::as_str),
+                    );
+                    rollback_credential(
+                        self.vault.as_ref(),
+                        proxy_credential_ref.as_deref(),
+                        prior_proxy_ref.as_deref(),
+                        prior_proxy_secret.as_deref().map(String::as_str),
+                    );
+                    return Err(error);
+                }
+            }
+        }
 
         if let Err(error) = self.write_document(&document) {
             rollback_credential(
@@ -188,6 +262,12 @@ impl AssetStore {
                 credential_ref.as_deref(),
                 prior_ref.as_deref(),
                 prior_secret.as_deref().map(String::as_str),
+            );
+            rollback_credential(
+                self.vault.as_ref(),
+                proxy_credential_ref.as_deref(),
+                prior_proxy_ref.as_deref(),
+                prior_proxy_secret.as_deref().map(String::as_str),
             );
             return Err(error);
         }
@@ -208,6 +288,10 @@ impl AssetStore {
             id: uuid::Uuid::new_v4().to_string(),
             name: duplicate_name(&source.name, &document.connections),
             credential_ref: None,
+            proxy: source.proxy.clone().map(|mut proxy| {
+                proxy.credential_ref = None;
+                proxy
+            }),
             last_connected_at: None,
             created_at: now.clone(),
             updated_at: now,
@@ -227,20 +311,64 @@ impl AssetStore {
             .find(|item| item.id == id)
             .cloned()
             .ok_or_else(|| AppError::asset_not_found("connection", id))?;
+        if document.connections.iter().any(|connection| {
+            connection.id != id && connection.jump_host_ids.iter().any(|jump| jump == id)
+        }) {
+            return Err(AppError::validation("该连接正被跳板链引用，请先解除引用"));
+        }
+        if document
+            .tunnels
+            .iter()
+            .any(|tunnel| tunnel.connection_id == id)
+        {
+            return Err(AppError::validation(
+                "该连接仍有关联隧道规则，请先删除隧道规则",
+            ));
+        }
         let secret = profile
             .credential_ref
             .as_deref()
             .map(|reference| self.vault.get(reference))
             .transpose()?
             .flatten();
+        let proxy_secret = profile
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.credential_ref.as_deref())
+            .map(|reference| self.vault.get(reference))
+            .transpose()?
+            .flatten();
         if let Some(reference) = profile.credential_ref.as_deref() {
             self.vault.delete(reference)?;
+        }
+        if let Some(reference) = profile
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.credential_ref.as_deref())
+        {
+            if let Err(error) = self.vault.delete(reference) {
+                if let (Some(reference), Some(secret)) =
+                    (profile.credential_ref.as_deref(), secret.as_ref())
+                {
+                    let _ = self.vault.set(reference, secret);
+                }
+                return Err(error);
+            }
         }
         document.connections.retain(|item| item.id != id);
         if let Err(error) = self.write_document(&document) {
             if let (Some(reference), Some(secret)) =
                 (profile.credential_ref.as_deref(), secret.as_ref())
             {
+                let _ = self.vault.set(reference, secret);
+            }
+            if let (Some(reference), Some(secret)) = (
+                profile
+                    .proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.credential_ref.as_deref()),
+                proxy_secret.as_ref(),
+            ) {
                 let _ = self.vault.set(reference, secret);
             }
             return Err(error);
@@ -330,6 +458,13 @@ impl AssetStore {
                 .transpose()?
                 .flatten(),
         };
+        let proxy_password = profile
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.credential_ref.as_deref())
+            .map(|reference| self.vault.get(reference))
+            .transpose()?
+            .flatten();
         if profile.auth_type == AuthType::Password && secret.is_none()
             || profile.credential_ref.is_some() && secret.is_none()
         {
@@ -362,6 +497,16 @@ impl AssetStore {
                 })
                 .filter(|value| !value.is_empty()),
             agent_key_fingerprint: profile.agent_key_fingerprint.clone(),
+            proxy: profile
+                .proxy
+                .as_ref()
+                .map(|proxy| crate::models::ProxyRequest {
+                    proxy_type: proxy.proxy_type,
+                    host: proxy.host.clone(),
+                    port: proxy.port,
+                    username: proxy.username.clone(),
+                    password: proxy_password.as_ref().map(|value| value.to_string()),
+                }),
             columns: 80,
             rows: 24,
             timeout_seconds: profile.timeout_seconds,
@@ -407,12 +552,115 @@ impl AssetStore {
         self.write_document(&document)
     }
 
+    pub fn save_tunnel(&self, request: SaveTunnelRequest) -> Result<TunnelProfile, AppError> {
+        validate_tunnel(&request)?;
+        let _guard = self.lock()?;
+        let mut document = self.read_document()?;
+        if !document
+            .connections
+            .iter()
+            .any(|connection| connection.id == request.connection_id)
+        {
+            return Err(AppError::asset_not_found(
+                "connection",
+                &request.connection_id,
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let id = request
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let existing = document.tunnels.iter().find(|tunnel| tunnel.id == id);
+        if request.id.is_some() && existing.is_none() {
+            return Err(AppError::asset_not_found("tunnel", &id));
+        }
+        let profile = TunnelProfile {
+            id: id.clone(),
+            name: request.name.trim().to_owned(),
+            connection_id: request.connection_id,
+            kind: request.kind,
+            bind_host: request.bind_host.trim().to_owned(),
+            bind_port: request.bind_port,
+            target_host: request
+                .target_host
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            target_port: request.target_port,
+            start_policy: request.start_policy,
+            created_at: existing.map_or_else(|| now.clone(), |tunnel| tunnel.created_at.clone()),
+            updated_at: now,
+        };
+        document.tunnels.retain(|tunnel| tunnel.id != id);
+        document.tunnels.push(profile.clone());
+        self.write_document(&document)?;
+        Ok(profile)
+    }
+
+    pub fn copy_tunnel(&self, id: &str) -> Result<TunnelProfile, AppError> {
+        let _guard = self.lock()?;
+        let mut document = self.read_document()?;
+        let source = document
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::asset_not_found("tunnel", id))?;
+        let now = Utc::now().to_rfc3339();
+        let copy = TunnelProfile {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: format!("{} - 副本", source.name),
+            bind_port: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            ..source
+        };
+        document.tunnels.push(copy.clone());
+        self.write_document(&document)?;
+        Ok(copy)
+    }
+
+    pub fn delete_tunnel(&self, id: &str) -> Result<(), AppError> {
+        let _guard = self.lock()?;
+        let mut document = self.read_document()?;
+        if !document.tunnels.iter().any(|tunnel| tunnel.id == id) {
+            return Err(AppError::asset_not_found("tunnel", id));
+        }
+        document.tunnels.retain(|tunnel| tunnel.id != id);
+        self.write_document(&document)
+    }
+
+    pub fn tunnel(&self, id: &str) -> Result<TunnelProfile, AppError> {
+        let _guard = self.lock()?;
+        self.read_document()?
+            .tunnels
+            .into_iter()
+            .find(|tunnel| tunnel.id == id)
+            .ok_or_else(|| AppError::asset_not_found("tunnel", id))
+    }
+
+    pub fn automatic_tunnels(&self, connection_id: &str) -> Result<Vec<TunnelProfile>, AppError> {
+        let _guard = self.lock()?;
+        Ok(self
+            .read_document()?
+            .tunnels
+            .into_iter()
+            .filter(|tunnel| {
+                tunnel.connection_id == connection_id
+                    && tunnel.start_policy == crate::models::TunnelStartPolicy::WithConnection
+            })
+            .collect())
+    }
+
     pub fn export_to(&self, path: &Path) -> Result<AssetTransferSummary, AppError> {
         let _guard = self.lock()?;
         let mut document = self.read_document()?;
         document.recent_targets.clear();
         for connection in &mut document.connections {
             connection.credential_ref = None;
+            if let Some(proxy) = &mut connection.proxy {
+                proxy.credential_ref = None;
+            }
         }
         let bytes = serde_json::to_vec_pretty(&document)
             .map_err(|error| AppError::asset_storage("无法生成导出文件", error.to_string()))?;
@@ -458,7 +706,10 @@ impl AssetStore {
         let mut duplicate_names = 0;
         let mut regenerated_ids = 0;
         let count = imported.connections.len();
-        for mut connection in imported.connections {
+        let mut connection_map = std::collections::HashMap::new();
+        let mut imported_connections = imported.connections;
+        for connection in &mut imported_connections {
+            let source_id = connection.id.clone();
             if document
                 .connections
                 .iter()
@@ -474,12 +725,34 @@ impl AssetStore {
                 connection.id = uuid::Uuid::new_v4().to_string();
                 regenerated_ids += 1;
             }
+            connection_map.insert(source_id, connection.id.clone());
+        }
+        for mut connection in imported_connections {
             connection.group_id = group_map
                 .get(&connection.group_id)
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_GROUP_ID.to_owned());
+            connection.jump_host_ids = connection
+                .jump_host_ids
+                .into_iter()
+                .map(|id| connection_map.get(&id).cloned().unwrap_or(id))
+                .collect();
             connection.credential_ref = None;
+            if let Some(proxy) = &mut connection.proxy {
+                proxy.credential_ref = None;
+            }
             document.connections.push(connection);
+        }
+        for mut tunnel in imported.tunnels {
+            let Some(connection_id) = connection_map.get(&tunnel.connection_id).cloned() else {
+                continue;
+            };
+            tunnel.connection_id = connection_id;
+            if document.tunnels.iter().any(|item| item.id == tunnel.id) {
+                tunnel.id = uuid::Uuid::new_v4().to_string();
+                regenerated_ids += 1;
+            }
+            document.tunnels.push(tunnel);
         }
         self.write_document(&document)?;
         Ok(AssetTransferSummary {
@@ -600,8 +873,11 @@ fn validate_connection(request: &SaveConnectionRequest) -> Result<(), AppError> 
     if request.name.trim().is_empty() || request.name.trim().chars().count() > 64 {
         return Err(AppError::validation("连接名称长度必须为 1～64 个字符"));
     }
-    if request.host.trim().is_empty() {
-        return Err(AppError::validation("请输入主机地址"));
+    if request.host.trim().is_empty()
+        || request.host.len() > 255
+        || request.host.contains(['\r', '\n', '\0'])
+    {
+        return Err(AppError::validation("主机地址无效"));
     }
     if request.username.trim().is_empty() || request.username.trim().chars().count() > 128 {
         return Err(AppError::validation("用户名长度必须为 1～128 个字符"));
@@ -611,6 +887,21 @@ fn validate_connection(request: &SaveConnectionRequest) -> Result<(), AppError> 
     }
     if !(5..=60).contains(&request.timeout_seconds) {
         return Err(AppError::validation("连接超时必须为 5～60 秒"));
+    }
+    if let Some(proxy) = &request.proxy {
+        if proxy.host.trim().is_empty()
+            || proxy.host.len() > 255
+            || proxy.host.contains(['\r', '\n', '\0'])
+        {
+            return Err(AppError::validation("代理主机地址无效"));
+        }
+        if proxy.username.as_deref().is_some_and(|username| {
+            username.trim().is_empty()
+                || username.len() > 255
+                || username.contains(['\r', '\n', '\0'])
+        }) {
+            return Err(AppError::validation("代理用户名无效"));
+        }
     }
     if request.auth_type == AuthType::PrivateKey {
         let path = request.private_key_path.as_deref().unwrap_or_default();
@@ -623,13 +914,117 @@ fn validate_connection(request: &SaveConnectionRequest) -> Result<(), AppError> 
     Ok(())
 }
 
+fn validate_tunnel(request: &SaveTunnelRequest) -> Result<(), AppError> {
+    let name = request.name.trim();
+    let bind_host = request.bind_host.trim();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err(AppError::validation("隧道名称长度必须为 1～64 个字符"));
+    }
+    if bind_host.is_empty() || bind_host.len() > 255 || bind_host.contains(['\r', '\n', '\0']) {
+        return Err(AppError::validation("隧道监听地址无效"));
+    }
+    if matches!(request.kind, TunnelKind::Local | TunnelKind::Dynamic)
+        && !is_loopback_host(bind_host)
+        && !request.allow_non_loopback
+    {
+        return Err(AppError::ssh(
+            "TUNNEL-RISK-CONFIRMATION-REQUIRED",
+            "非本机监听地址需要明确确认",
+            "local or dynamic tunnel requested a non-loopback bind without confirmation",
+            false,
+        ));
+    }
+    if request.kind != TunnelKind::Dynamic {
+        let target_host = request.target_host.as_deref().unwrap_or_default().trim();
+        if target_host.is_empty()
+            || target_host.len() > 255
+            || target_host.contains(['\r', '\n', '\0'])
+            || request.target_port.unwrap_or_default() == 0
+        {
+            return Err(AppError::validation("隧道目标地址或端口无效"));
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_jump_hosts(
+    connections: &[ConnectionProfile],
+    connection_id: &str,
+    jump_host_ids: &[String],
+) -> Result<(), AppError> {
+    if jump_host_ids.len() > 8 {
+        return Err(AppError::validation("跳板链最多包含 8 个连接"));
+    }
+    let mut unique = std::collections::HashSet::new();
+    for jump_id in jump_host_ids {
+        if jump_id == connection_id || !unique.insert(jump_id) {
+            return Err(AppError::ssh(
+                "JUMP-HOST-CYCLE",
+                "跳板链不能包含自身或重复节点",
+                "jump host chain contains a self-reference or duplicate",
+                false,
+            ));
+        }
+        if !connections
+            .iter()
+            .any(|connection| &connection.id == jump_id)
+        {
+            return Err(AppError::asset_not_found("jump-host", jump_id));
+        }
+        if jump_reaches(
+            connections,
+            jump_id,
+            connection_id,
+            &mut std::collections::HashSet::new(),
+        ) {
+            return Err(AppError::ssh(
+                "JUMP-HOST-CYCLE",
+                "跳板链存在循环引用",
+                "jump host graph contains a cycle",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn jump_reaches(
+    connections: &[ConnectionProfile],
+    current: &str,
+    target: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if current == target {
+        return true;
+    }
+    if !visited.insert(current.to_owned()) {
+        return false;
+    }
+    connections
+        .iter()
+        .find(|connection| connection.id == current)
+        .is_some_and(|connection| {
+            connection
+                .jump_host_ids
+                .iter()
+                .any(|jump| jump_reaches(connections, jump, target, visited))
+        })
+}
+
 fn parse_document(bytes: &[u8]) -> Result<AssetDocument, AppError> {
     let mut document: AssetDocument = serde_json::from_slice(bytes).map_err(|error| {
         AppError::asset_storage("连接数据已损坏，无法安全加载", error.to_string())
     })?;
     match document.schema_version {
         SCHEMA_VERSION => {}
-        0 | 1 => document.schema_version = SCHEMA_VERSION,
+        0..=2 => document.schema_version = SCHEMA_VERSION,
         version => {
             return Err(AppError::asset_storage(
                 "连接数据版本暂不受支持",
@@ -679,6 +1074,10 @@ fn credential_reference(id: &str, auth_type: AuthType) -> String {
         "passphrase"
     };
     format!("TerminalT/connection/{id}/{kind}")
+}
+
+fn proxy_credential_reference(id: &str) -> String {
+    format!("TerminalT/connection/{id}/proxy-password")
 }
 
 fn rollback_credential(
@@ -785,7 +1184,10 @@ mod tests {
     use crate::{
         credentials::CredentialVault,
         error::AppError,
-        models::{AuthType, GroupNameRequest, SaveConnectionRequest},
+        models::{
+            AuthType, GroupNameRequest, ProxyType, SaveConnectionRequest, SaveProxyRequest,
+            SaveTunnelRequest, TunnelKind, TunnelStartPolicy,
+        },
     };
     use zeroize::Zeroizing;
 
@@ -846,6 +1248,8 @@ mod tests {
             remember_credential: true,
             private_key_path: None,
             agent_key_fingerprint: None,
+            proxy: None,
+            jump_host_ids: Vec::new(),
             group_id: group_id.to_owned(),
             note: Some("primary server".to_owned()),
             timeout_seconds: 15,
@@ -981,7 +1385,7 @@ mod tests {
 
     #[test]
     fn legacy_schemas_migrate_and_restore_the_default_group() {
-        for version in [0, 1] {
+        for version in [0, 1, 2] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("connections.json");
             std::fs::write(
@@ -994,11 +1398,11 @@ mod tests {
             let store = AssetStore::new(path.clone(), std::sync::Arc::new(MemoryVault::default()));
             let snapshot = store.snapshot().unwrap();
 
-            assert_eq!(snapshot.schema_version, 2);
+            assert_eq!(snapshot.schema_version, 3);
             assert_eq!(snapshot.groups[0].id, DEFAULT_GROUP_ID);
             assert!(std::fs::read_to_string(path)
                 .unwrap()
-                .contains("\"schemaVersion\": 2"));
+                .contains("\"schemaVersion\": 3"));
         }
     }
 
@@ -1036,6 +1440,80 @@ mod tests {
         .unwrap();
         assert!(store.import_from(&import).is_err());
         assert!(store.snapshot().unwrap().connections.is_empty());
+    }
+
+    #[test]
+    fn proxy_secret_is_vault_only_and_jump_cycles_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("connections.json");
+        let store = AssetStore::new(path.clone(), std::sync::Arc::new(MemoryVault::default()));
+        let first = store.save_connection(request(DEFAULT_GROUP_ID)).unwrap();
+        let mut second_request = request(DEFAULT_GROUP_ID);
+        second_request.name = "Jump".to_owned();
+        second_request.host = "jump.example".to_owned();
+        second_request.proxy = Some(SaveProxyRequest {
+            proxy_type: ProxyType::Socks5,
+            host: "proxy.example".to_owned(),
+            port: 1080,
+            username: Some("proxy-user".to_owned()),
+            password: Some("proxy-secret".to_owned()),
+            remember_credential: true,
+        });
+        second_request.jump_host_ids = vec![first.id.clone()];
+        let second = store.save_connection(second_request).unwrap();
+
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(!persisted.contains("proxy-secret"));
+        assert_eq!(
+            store
+                .connection_request(&second.id, None)
+                .unwrap()
+                .proxy
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("proxy-secret")
+        );
+
+        let mut cycle = request(DEFAULT_GROUP_ID);
+        cycle.id = Some(first.id);
+        cycle.jump_host_ids = vec![second.id];
+        assert_eq!(
+            store.save_connection(cycle).unwrap_err().code,
+            "JUMP-HOST-CYCLE"
+        );
+    }
+
+    #[test]
+    fn tunnel_profiles_persist_and_non_loopback_requires_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::new(
+            directory.path().join("connections.json"),
+            std::sync::Arc::new(MemoryVault::default()),
+        );
+        let connection = store.save_connection(request(DEFAULT_GROUP_ID)).unwrap();
+        let mut tunnel = SaveTunnelRequest {
+            id: None,
+            name: "Database".to_owned(),
+            connection_id: connection.id.clone(),
+            kind: TunnelKind::Local,
+            bind_host: "0.0.0.0".to_owned(),
+            bind_port: 15432,
+            target_host: Some("db.internal".to_owned()),
+            target_port: Some(5432),
+            start_policy: TunnelStartPolicy::Manual,
+            allow_non_loopback: false,
+        };
+        assert_eq!(
+            store.save_tunnel(tunnel.clone()).unwrap_err().code,
+            "TUNNEL-RISK-CONFIRMATION-REQUIRED"
+        );
+        tunnel.allow_non_loopback = true;
+        let saved = store.save_tunnel(tunnel).unwrap();
+        assert_eq!(store.snapshot().unwrap().tunnels.len(), 1);
+        assert!(store.delete_connection(&connection.id).is_err());
+        store.delete_tunnel(&saved.id).unwrap();
+        store.delete_connection(&connection.id).unwrap();
     }
 }
 

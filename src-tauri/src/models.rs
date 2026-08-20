@@ -124,6 +124,8 @@ pub struct ConnectionRequest {
     pub private_key_passphrase: Option<String>,
     #[serde(default)]
     pub agent_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<ProxyRequest>,
     pub columns: u16,
     pub rows: u16,
     pub timeout_seconds: u64,
@@ -141,8 +143,8 @@ impl ConnectionRequest {
         if self.name.is_empty() || self.name.chars().count() > 64 {
             return Err("连接名称长度必须为 1～64 个字符");
         }
-        if self.host.is_empty() {
-            return Err("请输入主机地址");
+        if self.host.is_empty() || self.host.len() > 255 || self.host.contains(['\r', '\n', '\0']) {
+            return Err("主机地址无效");
         }
         if self.username.is_empty() || self.username.chars().count() > 128 {
             return Err("用户名长度必须为 1～128 个字符");
@@ -189,6 +191,44 @@ pub enum AuthType {
     PrivateKey,
     KeyboardInteractive,
     Agent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyType {
+    Http,
+    Socks5,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequest {
+    pub proxy_type: ProxyType,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProfile {
+    pub proxy_type: ProxyType,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub credential_ref: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveProxyRequest {
+    pub proxy_type: ProxyType,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub remember_credential: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -256,6 +296,10 @@ pub struct ConnectionProfile {
     pub private_key_path: Option<String>,
     #[serde(default)]
     pub agent_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<ProxyProfile>,
+    #[serde(default)]
+    pub jump_host_ids: Vec<String>,
     pub group_id: String,
     pub note: Option<String>,
     pub timeout_seconds: u64,
@@ -277,6 +321,9 @@ pub struct SaveConnectionRequest {
     pub remember_credential: bool,
     pub private_key_path: Option<String>,
     pub agent_key_fingerprint: Option<String>,
+    pub proxy: Option<SaveProxyRequest>,
+    #[serde(default)]
+    pub jump_host_ids: Vec<String>,
     pub group_id: String,
     pub note: Option<String>,
     pub timeout_seconds: u64,
@@ -297,6 +344,83 @@ pub struct ConnectionAssetSnapshot {
     pub groups: Vec<ConnectionGroup>,
     pub connections: Vec<ConnectionProfile>,
     pub recent_targets: Vec<RecentTarget>,
+    pub tunnels: Vec<TunnelProfile>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TunnelKind {
+    Local,
+    Remote,
+    Dynamic,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TunnelStartPolicy {
+    Manual,
+    WithConnection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelProfile {
+    pub id: String,
+    pub name: String,
+    pub connection_id: String,
+    pub kind: TunnelKind,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    pub start_policy: TunnelStartPolicy,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTunnelRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub connection_id: String,
+    pub kind: TunnelKind,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    pub start_policy: TunnelStartPolicy,
+    pub allow_non_loopback: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelStatus {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelRuntimeState {
+    pub runtime_id: String,
+    pub profile_id: String,
+    pub session_id: String,
+    pub status: TunnelStatus,
+    pub bound_port: u16,
+    pub active_connections: u32,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelStatusPayload {
+    pub tunnel: TunnelRuntimeState,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -416,6 +540,7 @@ mod tests {
             private_key_path: None,
             private_key_passphrase: None,
             agent_key_fingerprint: None,
+            proxy: None,
             columns: 80,
             rows: 24,
             timeout_seconds: 15,

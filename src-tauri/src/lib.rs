@@ -5,9 +5,11 @@ mod diagnostics;
 mod error;
 mod known_hosts;
 mod models;
+mod network;
 mod session;
 mod settings;
 mod ssh_client;
+mod tunnel;
 
 use chrono::Utc;
 use error::AppError;
@@ -16,8 +18,9 @@ use models::{
     ConnectionGroup, ConnectionProfile, ConnectionProgressPayload, ConnectionRequest,
     ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval, HostKeyInspection,
     KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing, SaveConnectionRequest,
-    SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
-    TransferDirection, TransferTask, WindowState,
+    SaveTunnelRequest, SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus,
+    SessionStatusPayload, TransferDirection, TransferTask, TunnelProfile, TunnelRuntimeState,
+    WindowState,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -113,6 +116,56 @@ fn delete_connection_profile(
     connection_id: String,
 ) -> Result<(), AppError> {
     store.delete_connection(&connection_id)
+}
+
+#[tauri::command]
+fn save_tunnel_profile(
+    store: State<'_, assets::AssetStore>,
+    request: SaveTunnelRequest,
+) -> Result<TunnelProfile, AppError> {
+    store.save_tunnel(request)
+}
+
+#[tauri::command]
+fn copy_tunnel_profile(
+    store: State<'_, assets::AssetStore>,
+    tunnel_id: String,
+) -> Result<TunnelProfile, AppError> {
+    store.copy_tunnel(&tunnel_id)
+}
+
+#[tauri::command]
+fn delete_tunnel_profile(
+    store: State<'_, assets::AssetStore>,
+    tunnel_id: String,
+) -> Result<(), AppError> {
+    store.delete_tunnel(&tunnel_id)
+}
+
+#[tauri::command]
+fn list_runtime_tunnels(
+    registry: State<'_, tunnel::TunnelRegistry>,
+) -> Result<Vec<TunnelRuntimeState>, AppError> {
+    registry.list()
+}
+
+#[tauri::command]
+async fn start_tunnel(
+    sessions: State<'_, SessionRegistry>,
+    store: State<'_, assets::AssetStore>,
+    session_id: String,
+    tunnel_id: String,
+) -> Result<TunnelRuntimeState, AppError> {
+    let profile = store.tunnel(&tunnel_id)?;
+    sessions.start_tunnel(&session_id, profile).await
+}
+
+#[tauri::command]
+fn stop_tunnel(
+    registry: State<'_, tunnel::TunnelRegistry>,
+    runtime_id: String,
+) -> Result<TunnelRuntimeState, AppError> {
+    registry.stop(&runtime_id)
 }
 
 #[tauri::command]
@@ -402,6 +455,7 @@ async fn inspect_ssh_host_key(
     host: String,
     port: u16,
     timeout_seconds: u64,
+    proxy: Option<models::ProxyRequest>,
 ) -> Result<HostKeyInspection, AppError> {
     let host = host.trim().to_owned();
     if host.is_empty() {
@@ -424,6 +478,7 @@ async fn inspect_ssh_host_key(
             port,
             time::Duration::from_secs(timeout_seconds),
             known_hosts_path,
+            proxy.as_ref(),
         ) => result,
         _ = cancellation => Err(AppError::cancelled()),
     };
@@ -548,7 +603,27 @@ async fn connect_saved_connection(
     let mut connection =
         store.connection_request(&request.connection_id, request.temporary_secret)?;
     apply_keepalive(&mut connection, request.keepalive);
-    let session = connect_ssh(app, operations, operation_id, connection, request.approval).await?;
+    let session = connect_ssh(
+        app.clone(),
+        operations,
+        operation_id,
+        connection,
+        request.approval,
+    )
+    .await?;
+    for tunnel in store.automatic_tunnels(&request.connection_id)? {
+        if let Err(error) = app
+            .state::<SessionRegistry>()
+            .start_tunnel(&session.id, tunnel)
+            .await
+        {
+            log::warn!(
+                "automatic tunnel start failed: {}: {}",
+                error.code,
+                error.message
+            );
+        }
+    }
     if let Err(error) = store.mark_connected(&request.connection_id) {
         log::warn!("failed to update last-connected timestamp: {}", error.code);
     }
@@ -695,6 +770,7 @@ fn emit_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Result<(), A
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(SessionRegistry::default())
+        .manage(tunnel::TunnelRegistry::default())
         .manage(OperationRegistry::default())
         .manage(authentication::AuthenticationBroker::default())
         .plugin(tauri_plugin_dialog::init())
@@ -758,6 +834,12 @@ pub fn run() {
             save_connection_profile,
             copy_connection_profile,
             delete_connection_profile,
+            save_tunnel_profile,
+            copy_tunnel_profile,
+            delete_tunnel_profile,
+            list_runtime_tunnels,
+            start_tunnel,
+            stop_tunnel,
             save_connection_group,
             delete_connection_group,
             record_recent_target,
@@ -796,6 +878,15 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            match tauri::async_runtime::block_on(
+                app_handle
+                    .state::<tunnel::TunnelRegistry>()
+                    .stop_all_bounded(time::Duration::from_secs(2)),
+            ) {
+                Ok(true) => {}
+                Ok(false) => log::warn!("tunnel shutdown exceeded the 2 second deadline"),
+                Err(error) => log::error!("{}: {}", error.code, error.message),
+            }
             match tauri::async_runtime::block_on(
                 app_handle
                     .state::<SessionRegistry>()

@@ -4,7 +4,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
 
 use crate::error::AppError;
-use crate::models::{RemoteDirectoryListing, TransferDirection, TransferTask};
+use crate::models::{
+    RemoteDirectoryListing, TransferDirection, TransferTask, TunnelProfile, TunnelRuntimeState,
+};
 
 #[derive(Debug)]
 pub enum SessionCommand {
@@ -40,6 +42,10 @@ pub enum SessionCommand {
     },
     CancelTransfer {
         task_id: String,
+    },
+    StartTunnel {
+        profile: TunnelProfile,
+        response: oneshot::Sender<Result<TunnelRuntimeState, AppError>>,
     },
     Close,
 }
@@ -256,6 +262,22 @@ impl SessionRegistry {
 
     pub fn cancel_transfer(&self, session_id: &str, task_id: String) -> Result<(), AppError> {
         self.send(session_id, SessionCommand::CancelTransfer { task_id })
+    }
+
+    pub async fn start_tunnel(
+        &self,
+        session_id: &str,
+        profile: TunnelProfile,
+    ) -> Result<TunnelRuntimeState, AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::StartTunnel { profile, response })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
     }
 
     fn ssh_commands(&self, session_id: &str) -> Result<mpsc::Sender<SessionCommand>, AppError> {

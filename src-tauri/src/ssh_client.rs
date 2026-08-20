@@ -5,9 +5,9 @@ use std::{
 };
 
 use russh::{
-    client::{self, KeyboardInteractiveAuthResponse},
+    client::{self, ChannelOpenHandle, KeyboardInteractiveAuthResponse},
     keys::{agent::AgentIdentity, load_secret_key, ssh_key, PrivateKeyWithHashAlg},
-    ChannelMsg, Disconnect,
+    ChannelMsg, ChannelOpenFailure, Disconnect,
 };
 use russh_sftp::{client::SftpSession, protocol::FileType};
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,7 +27,9 @@ use crate::{
         SessionState, SessionStatus, SessionStatusPayload, TransferDirection,
         TransferProgressPayload, TransferStatus, TransferTask,
     },
+    network,
     session::{SessionCommand, SessionRegistry},
+    tunnel::{self, RemoteForwardTable},
 };
 
 const SESSION_OUTPUT_EVENT: &str = "session-output";
@@ -64,9 +66,10 @@ impl client::Handler for ProbeHandler {
 }
 
 #[derive(Clone)]
-struct VerifiedHandler {
+pub(crate) struct VerifiedHandler {
     expected_fingerprint: String,
     captured_key: Arc<Mutex<Option<ssh_key::PublicKey>>>,
+    remote_forwards: RemoteForwardTable,
 }
 
 impl client::Handler for VerifiedHandler {
@@ -84,6 +87,38 @@ impl client::Handler for VerifiedHandler {
         }
         Ok(fingerprint == self.expected_fingerprint)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = self.remote_forwards.lock().ok().and_then(|forwards| {
+            forwards
+                .get(&(connected_address.to_owned(), connected_port))
+                .or_else(|| {
+                    forwards
+                        .iter()
+                        .find(|((_, port), _)| *port == connected_port)
+                        .map(|(_, target)| target)
+                })
+                .cloned()
+        });
+        if let Some(target) = target {
+            reply.accept().await;
+            tauri::async_runtime::spawn(tunnel::bridge_remote_channel(channel, target));
+        } else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        }
+        Ok(())
+    }
 }
 
 pub async fn inspect_host_key(
@@ -91,19 +126,28 @@ pub async fn inspect_host_key(
     port: u16,
     timeout: Duration,
     known_hosts_path: PathBuf,
+    proxy: Option<&crate::models::ProxyRequest>,
 ) -> Result<HostKeyInspection, AppError> {
     let captured_key = Arc::new(Mutex::new(None));
     let handler = ProbeHandler {
         captured_key: Arc::clone(&captured_key),
     };
     let config = Arc::new(client_config(None));
-    let connection = tokio::time::timeout(
-        timeout,
-        client::connect(config, (host.to_owned(), port), handler),
-    )
-    .await
-    .map_err(|_| connection_timeout())?
-    .map_err(map_connect_error)?;
+    let connection = if let Some(proxy) = proxy {
+        let stream = network::connect_target(host, port, Some(proxy), timeout).await?;
+        tokio::time::timeout(timeout, client::connect_stream(config, stream, handler))
+            .await
+            .map_err(|_| connection_timeout())?
+            .map_err(map_connect_error)?
+    } else {
+        tokio::time::timeout(
+            timeout,
+            client::connect(config, (host.to_owned(), port), handler),
+        )
+        .await
+        .map_err(|_| connection_timeout())?
+        .map_err(map_connect_error)?
+    };
     let _ = connection
         .disconnect(Disconnect::ByApplication, "host key inspected", "")
         .await;
@@ -143,7 +187,7 @@ pub async fn test_connection(
     let host = request.host.clone();
     let port = request.port;
     let timeout = authentication_timeout(&request);
-    let (handle, identity) = tokio::time::timeout(
+    let (handle, identity, _) = tokio::time::timeout(
         timeout,
         connect_authenticated(
             &mut request,
@@ -218,7 +262,7 @@ async fn start_session_with_id(
     let port = request.port;
     let columns = request.columns;
     let rows = request.rows;
-    let (handle, identity) = tokio::time::timeout(
+    let (handle, identity, remote_forwards) = tokio::time::timeout(
         timeout,
         connect_authenticated(
             &mut request,
@@ -261,7 +305,15 @@ async fn start_session_with_id(
     let task_app = app.clone();
     let task_session_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        run_session(task_app, task_session_id, handle, channel, commands_rx).await;
+        run_session(
+            task_app,
+            task_session_id,
+            handle,
+            channel,
+            commands_rx,
+            remote_forwards,
+        )
+        .await;
         let _ = completion_tx.send(());
     });
 
@@ -277,38 +329,63 @@ async fn connect_authenticated(
     request: &mut ConnectionRequest,
     expected_fingerprint: &str,
     authentication_context: Option<AuthenticationContext<'_>>,
-) -> Result<(client::Handle<VerifiedHandler>, HostKeyIdentity), AppError> {
+) -> Result<
+    (
+        client::Handle<VerifiedHandler>,
+        HostKeyIdentity,
+        RemoteForwardTable,
+    ),
+    AppError,
+> {
     let captured_key = Arc::new(Mutex::new(None));
+    let remote_forwards = RemoteForwardTable::default();
     let handler = VerifiedHandler {
         expected_fingerprint: expected_fingerprint.to_owned(),
         captured_key: Arc::clone(&captured_key),
+        remote_forwards: Arc::clone(&remote_forwards),
     };
     let keepalive = request
         .keepalive_enabled
         .then(|| Duration::from_secs(request.keepalive_seconds));
     let config = Arc::new(client_config(keepalive));
-    let mut handle = client::connect(config, (request.host.clone(), request.port), handler)
-        .await
-        .map_err(|error| {
-            let actual = captured_key
-                .lock()
-                .ok()
-                .and_then(|key| key.clone())
-                .map(|key| key.fingerprint(russh::keys::HashAlg::Sha256).to_string());
-            if actual
-                .as_deref()
-                .is_some_and(|value| value != expected_fingerprint)
-            {
-                AppError::ssh(
-                    "HOST-KEY-CHANGED",
-                    "服务器身份与确认时不一致，连接已阻止",
-                    "server host key changed between inspection and connection",
-                    false,
-                )
-            } else {
-                map_connect_error(error)
-            }
-        })?;
+    let connection = async {
+        if let Some(proxy) = request.proxy.as_ref() {
+            let stream = network::connect_target(
+                &request.host,
+                request.port,
+                Some(proxy),
+                Duration::from_secs(request.timeout_seconds),
+            )
+            .await?;
+            client::connect_stream(config, stream, handler)
+                .await
+                .map_err(map_connect_error)
+        } else {
+            client::connect(config, (request.host.clone(), request.port), handler)
+                .await
+                .map_err(map_connect_error)
+        }
+    };
+    let mut handle = connection.await.map_err(|error| {
+        let actual = captured_key
+            .lock()
+            .ok()
+            .and_then(|key| key.clone())
+            .map(|key| key.fingerprint(russh::keys::HashAlg::Sha256).to_string());
+        if actual
+            .as_deref()
+            .is_some_and(|value| value != expected_fingerprint)
+        {
+            AppError::ssh(
+                "HOST-KEY-CHANGED",
+                "服务器身份与确认时不一致，连接已阻止",
+                "server host key changed between inspection and connection",
+                false,
+            )
+        } else {
+            error
+        }
+    })?;
 
     let key = captured_key
         .lock()
@@ -391,7 +468,7 @@ async fn connect_authenticated(
         ));
     }
 
-    Ok((handle, identity))
+    Ok((handle, identity, remote_forwards))
 }
 
 fn authentication_timeout(request: &ConnectionRequest) -> Duration {
@@ -623,6 +700,7 @@ async fn run_session(
     handle: client::Handle<VerifiedHandler>,
     channel: russh::Channel<client::Msg>,
     mut commands: mpsc::Receiver<SessionCommand>,
+    remote_forwards: RemoteForwardTable,
 ) {
     app.state::<crate::diagnostics::DiagnosticLog>().record(
         "ssh-session-start",
@@ -690,6 +768,19 @@ async fn run_session(
                         let _ = cancellation.send(());
                     }
                 }
+                Some(SessionCommand::StartTunnel { profile, response }) => {
+                    let result = app
+                        .state::<crate::tunnel::TunnelRegistry>()
+                        .start(
+                            app.clone(),
+                            session_id.clone(),
+                            profile,
+                            Arc::clone(&handle),
+                            Arc::clone(&remote_forwards),
+                        )
+                        .await;
+                    let _ = response.send(result);
+                }
                 Some(SessionCommand::Close) | None => {
                     let _ = writer.close().await;
                     break "会话已关闭".to_owned();
@@ -736,9 +827,15 @@ async fn run_session(
         }
     })
     .await;
-    let _ = handle
-        .disconnect(Disconnect::ByApplication, "session closed", "")
-        .await;
+    let tunnel_lease_active = app
+        .state::<crate::tunnel::TunnelRegistry>()
+        .has_active_session(&session_id)
+        .unwrap_or(false);
+    if !tunnel_lease_active {
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "session closed", "")
+            .await;
+    }
     let _ = app.state::<SessionRegistry>().remove_finished(&session_id);
     let _ = app.emit(
         SESSION_STATUS_EVENT,
@@ -1789,6 +1886,7 @@ mod tests {
             private_key_path: None,
             private_key_passphrase: None,
             agent_key_fingerprint: None,
+            proxy: None,
             columns: 100,
             rows: 30,
             timeout_seconds: 5,
@@ -1801,7 +1899,7 @@ mod tests {
     async fn password_authentication_opens_pty_shell() {
         let (address, fingerprint, server) = start_server().await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let mut channel = handle.channel_open_session().await.unwrap();
@@ -1864,7 +1962,7 @@ mod tests {
         for index in 0..10 {
             let mut connection = request(address, AuthType::Password);
             connection.name = format!("session-{index}");
-            let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+            let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
                 .await
                 .unwrap();
             handles.push(handle);
@@ -1925,7 +2023,7 @@ mod tests {
         let startup_output = vec![b'L'; OUTPUT_SIZE];
         let (address, fingerprint, server) = start_server_with_output(startup_output).await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let channel = handle.channel_open_session().await.unwrap();
@@ -1986,7 +2084,7 @@ mod tests {
         .to_vec();
         let (address, fingerprint, server) = start_server_with_output(expected.clone()).await;
         let mut connection = request(address, AuthType::Password);
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         let mut channel = handle.channel_open_session().await.unwrap();
@@ -2033,7 +2131,7 @@ mod tests {
         connection.password = None;
         connection.private_key_path = Some(key_path.to_string_lossy().into_owned());
 
-        let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
             .await
             .unwrap();
         handle
@@ -2076,7 +2174,7 @@ mod tests {
             connection.password = None;
             connection.private_key_path = Some(path.to_string_lossy().into_owned());
             connection.private_key_passphrase = passphrase;
-            let (handle, _) = connect_authenticated(&mut connection, &fingerprint, None)
+            let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
                 .await
                 .unwrap();
             handle
@@ -2116,6 +2214,7 @@ mod tests {
             address.port(),
             Duration::from_secs(5),
             path.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -2139,6 +2238,7 @@ mod tests {
             address.port(),
             Duration::from_secs(5),
             path,
+            None,
         )
         .await
         .unwrap();

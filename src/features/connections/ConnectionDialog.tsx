@@ -12,6 +12,7 @@ import type {
   HostKeyInspection,
   AuthenticationPromptPayload,
   AgentIdentityInfo,
+  ConnectionProfile,
 } from '../../domain/connection/types'
 import {
   initialConnectionDraft,
@@ -36,6 +37,7 @@ interface ConnectionDialogProps {
   open: boolean
   initialDraft?: ConnectionDraft
   groups?: ConnectionGroup[]
+  connections?: ConnectionProfile[]
   reconnecting?: boolean
   keepalive: { enabled: boolean; seconds: number }
   onClose: () => void
@@ -59,6 +61,7 @@ export function ConnectionDialog({
   open: visible,
   initialDraft: suppliedDraft,
   groups = [],
+  connections = [],
   reconnecting = false,
   keepalive,
   onClose,
@@ -85,6 +88,7 @@ export function ConnectionDialog({
   const busy = Boolean(operationId)
   const locked = authFailures >= 3
   const hasStoredCredential = Boolean(suppliedDraft?.id && suppliedDraft.rememberCredential)
+  const hasStoredProxyCredential = Boolean(suppliedDraft?.id && suppliedDraft.rememberProxyCredential)
 
   useEffect(() => {
     let disposed = false
@@ -184,7 +188,7 @@ export function ConnectionDialog({
   }
 
   const begin = async (nextIntent: Intent) => {
-    const nextErrors = validateConnectionDraft(draft, hasStoredCredential)
+    const nextErrors = validateConnectionDraft(draft, hasStoredCredential, hasStoredProxyCredential)
     setErrors(nextErrors)
     setCommandError(undefined)
     setTestResult(undefined)
@@ -303,7 +307,7 @@ export function ConnectionDialog({
   }
 
   const save = async () => {
-    const nextErrors = validateConnectionDraft(draft, true)
+    const nextErrors = validateConnectionDraft(draft, true, hasStoredProxyCredential)
     if ((draft.authType === 'password' || draft.authType === 'privateKey') && draft.rememberCredential && !hasStoredCredential && !currentSecret(draft)) {
       if (draft.authType === 'password') nextErrors.password = '请输入需要保存的密码'
       else nextErrors.privateKeyPassphrase = '请输入私钥口令，或取消记住口令'
@@ -417,6 +421,58 @@ export function ConnectionDialog({
               <span>{draft.authType === 'password' ? '记住密码' : '记住私钥口令'}（使用 Windows 凭据库）</span>
             </label>
           )}
+
+          <fieldset className="network-path-settings">
+            <legend>网络路径</legend>
+            <label className="remember-row">
+              <input type="checkbox" checked={draft.proxyEnabled} onChange={(event) => update('proxyEnabled', event.target.checked)} />
+              <span>通过出站代理连接</span>
+            </label>
+            {draft.proxyEnabled && (
+              <div className="network-path-body">
+                <div className="form-grid">
+                  <Field label="代理协议">
+                    <select value={draft.proxyType} onChange={(event) => update('proxyType', event.target.value as ConnectionDraft['proxyType'])}>
+                      <option value="http">HTTP CONNECT</option>
+                      <option value="socks5">SOCKS5</option>
+                    </select>
+                  </Field>
+                  <Field label="代理端口" error={errors.proxyPort}>
+                    <input type="number" min={1} max={65535} value={draft.proxyPort} onChange={(event) => update('proxyPort', Number(event.target.value))} />
+                  </Field>
+                </div>
+                <Field label="代理主机" error={errors.proxyHost}>
+                  <input value={draft.proxyHost} onChange={(event) => update('proxyHost', event.target.value)} placeholder="proxy.example.com" />
+                </Field>
+                <div className="form-grid">
+                  <Field label="代理用户名（可选）" error={errors.proxyUsername}>
+                    <input value={draft.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} autoComplete="off" />
+                  </Field>
+                  <Field label="代理密码" error={errors.proxyPassword}>
+                    <input type="password" value={draft.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} autoComplete="new-password" />
+                  </Field>
+                </div>
+                {draft.proxyUsername && <label className="remember-row"><input type="checkbox" checked={draft.rememberProxyCredential} onChange={(event) => update('rememberProxyCredential', event.target.checked)} /><span>使用 Windows 凭据库保存代理密码</span></label>}
+              </div>
+            )}
+
+            {draft.id && connections.length > 1 && (
+              <div className="jump-host-editor">
+                <span>跳板链</span>
+                <select aria-label="添加跳板连接" value="" onChange={(event) => {
+                  const id = event.target.value
+                  if (id && !draft.jumpHostIds.includes(id)) update('jumpHostIds', [...draft.jumpHostIds, id])
+                }}>
+                  <option value="">添加已有连接…</option>
+                  {connections.filter((connection) => connection.id !== draft.id && !draft.jumpHostIds.includes(connection.id)).map((connection) => <option key={connection.id} value={connection.id}>{connection.name} · {connection.username}@{connection.host}</option>)}
+                </select>
+                {draft.jumpHostIds.map((id, index) => {
+                  const connection = connections.find((candidate) => candidate.id === id)
+                  return <div className="jump-host-row" key={id}><strong>{index + 1}</strong><span>{connection?.name ?? '失效连接'}</span><button type="button" disabled={index === 0} onClick={() => { const next = [...draft.jumpHostIds]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; update('jumpHostIds', next) }}>上移</button><button type="button" disabled={index === draft.jumpHostIds.length - 1} onClick={() => { const next = [...draft.jumpHostIds]; [next[index], next[index + 1]] = [next[index + 1], next[index]]; update('jumpHostIds', next) }}>下移</button><button type="button" onClick={() => update('jumpHostIds', draft.jumpHostIds.filter((value) => value !== id))}>移除</button></div>
+                })}
+              </div>
+            )}
+          </fieldset>
           {onSave && (
             <Field label="备注" error={errors.note}>
               <textarea value={draft.note} onChange={(event) => update('note', event.target.value)} maxLength={500} rows={3} placeholder="用途、环境或维护信息" />
