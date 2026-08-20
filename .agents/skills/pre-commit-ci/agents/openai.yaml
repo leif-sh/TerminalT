@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pre-commit CI"
+  short_description: "Run TerminalT local CI before source commits"
+  default_prompt: "Use $pre-commit-ci to validate TerminalT changes before committing."

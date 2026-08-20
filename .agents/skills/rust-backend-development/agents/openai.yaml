@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Backend Development"
+  short_description: "Develop TerminalT Rust backend safely and verifiably"
+  default_prompt: "Use $rust-backend-development to implement a TerminalT Rust backend change."
