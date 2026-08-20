@@ -232,12 +232,12 @@ TunnelProfile
 
 | 阶段 | 主题 | 优先级 | 主要成果 | 前置阶段 |
 | --- | --- | --- | --- | --- |
-| 7 | 认证兼容性 | P0 | 交互认证、2FA、每次询问、SSH Agent | 规范恢复 |
-| 8 | 网络路径与 SSH 隧道 | P0 | 代理、多跳、`-L/-R/-D` | 7 |
-| 9 | SFTP 完整工作流 | P0 | 目录递归、批量、权限、队列恢复 | 7 |
-| 10 | 安全更新与发布 | P0 | 签名自动更新、通道、回滚验证 | 7；可与 8/9 并行 |
-| 11 | 终端工作区效率 | P1 | 分屏、布局、标签增强、自动重连 | 8 |
-| 12 | 运维生产力 | P1 | 快速命令、并发会话、监控、远程编辑 | 9、11 |
+| 7 | [认证兼容性](./development-stages/STAGE_7_AUTHENTICATION_COMPATIBILITY.md) | P0 | 交互认证、2FA、每次询问、SSH Agent | 规范恢复 |
+| 8 | [网络路径与 SSH 隧道](./development-stages/STAGE_8_NETWORK_PATHS_AND_TUNNELS.md) | P0 | 代理、多跳、`-L/-R/-D` | 7 |
+| 9 | [SFTP 完整工作流](./development-stages/STAGE_9_COMPLETE_SFTP_WORKFLOW.md) | P0 | 目录递归、批量、权限、队列恢复 | 7 |
+| 10 | [安全更新与发布](./development-stages/STAGE_10_SECURE_UPDATES_AND_RELEASE.md) | P0 | 签名自动更新、通道、回滚验证 | 7；可与 8/9 并行 |
+| 11 | [终端工作区效率](./development-stages/STAGE_11_TERMINAL_WORKSPACE.md) | P1 | 分屏、布局、标签增强、自动重连 | 8 |
+| 12 | [运维生产力](./development-stages/STAGE_12_OPERATIONS_PRODUCTIVITY.md) | P1 | 快速命令、并发会话、监控、远程编辑 | 9、11 |
 
 ### 7.1 阶段 7：认证兼容性
 
@@ -546,4 +546,3 @@ WORKSPACE-RESTORE-*
 - 终端基础操作与分屏：https://docs.xterminal.cn/terminal/basic-operations/
 - 快速命令：https://docs.xterminal.cn/quick-commands/overview/
 - 软件更新：https://docs.xterminal.cn/settings/update/
-
