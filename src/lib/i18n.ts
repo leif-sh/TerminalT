@@ -8,7 +8,7 @@ const zhCN = {
   defaultGroup: '默认分组',
   noConnections: '还没有保存的连接',
   noConnectionsHint: '新建连接后，可在这里快速访问你的服务器。',
-  stageZeroLabel: '阶段 8 · 网络路径已完成',
+  stageZeroLabel: '阶段 9 · SFTP 工作流已完成',
   workspaceTitle: '会话工作区',
   workspaceDescription: '新建临时连接，安全确认服务器身份后进入远程 Shell。',
   startMockSession: '启动模拟终端',

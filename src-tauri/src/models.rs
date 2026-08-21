@@ -17,7 +17,7 @@ pub struct SessionState {
     pub started_at: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionStatus {
     Connecting,
@@ -52,6 +52,10 @@ pub struct RemoteDirectoryEntry {
     pub size: u64,
     pub modified_at: Option<String>,
     pub permissions: String,
+    pub permission_mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub symlink_target: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -70,6 +74,7 @@ pub struct RemoteDirectoryListing {
     pub parent_path: Option<String>,
     pub entries: Vec<RemoteDirectoryEntry>,
     pub truncated: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -79,30 +84,52 @@ pub enum TransferDirection {
     Download,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferConflictPolicy {
+    Ask,
+    Overwrite,
+    Skip,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransferStatus {
     Queued,
+    Scanning,
     Running,
-    Succeeded,
+    Completed,
     Failed,
     Cancelled,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferTask {
     pub id: String,
+    pub created_at: String,
     pub session_id: String,
     pub file_name: String,
     pub direction: TransferDirection,
     pub source: String,
     pub target: String,
+    pub sources: Vec<String>,
+    pub target_directory: String,
+    pub conflict_policy: TransferConflictPolicy,
     pub transferred_bytes: u64,
     pub total_bytes: Option<u64>,
+    pub total_files: u64,
+    pub total_directories: u64,
+    pub completed_files: u64,
+    pub completed_directories: u64,
+    pub skipped_files: u64,
     pub bytes_per_second: u64,
+    pub current_path: Option<String>,
+    pub elapsed_seconds: u64,
     pub status: TransferStatus,
     pub error: Option<String>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

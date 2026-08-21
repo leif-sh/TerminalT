@@ -5,7 +5,8 @@ use tokio::time::{self, Duration};
 
 use crate::error::AppError;
 use crate::models::{
-    RemoteDirectoryListing, TransferDirection, TransferTask, TunnelProfile, TunnelRuntimeState,
+    RemoteDirectoryListing, TransferConflictPolicy, TransferDirection, TransferTask, TunnelProfile,
+    TunnelRuntimeState,
 };
 
 #[derive(Debug)]
@@ -17,6 +18,7 @@ pub enum SessionCommand {
     },
     ListRemoteDirectory {
         path: String,
+        cursor: Option<String>,
         response: oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
     },
     CreateRemoteDirectory {
@@ -30,14 +32,21 @@ pub enum SessionCommand {
         response: oneshot::Sender<Result<(), AppError>>,
     },
     DeleteRemoteEntry {
-        path: String,
+        paths: Vec<String>,
+        recursive: bool,
+        response: oneshot::Sender<Result<(), AppError>>,
+    },
+    ChangeRemotePermissions {
+        paths: Vec<String>,
+        mode: u32,
+        recursive: bool,
         response: oneshot::Sender<Result<(), AppError>>,
     },
     StartTransfer {
         direction: TransferDirection,
-        source: String,
-        target: String,
-        overwrite: bool,
+        sources: Vec<String>,
+        target_directory: String,
+        conflict_policy: TransferConflictPolicy,
         response: oneshot::Sender<Result<TransferTask, AppError>>,
     },
     CancelTransfer {
@@ -153,6 +162,7 @@ impl SessionRegistry {
         &self,
         session_id: &str,
         path: String,
+        cursor: Option<String>,
     ) -> Result<RemoteDirectoryListing, AppError> {
         let commands = {
             let sessions = self
@@ -169,7 +179,11 @@ impl SessionRegistry {
         };
         let (response, receiver) = oneshot::channel();
         commands
-            .send(SessionCommand::ListRemoteDirectory { path, response })
+            .send(SessionCommand::ListRemoteDirectory {
+                path,
+                cursor,
+                response,
+            })
             .await
             .map_err(|error| AppError::session_command_failed(error.to_string()))?;
         receiver
@@ -219,15 +233,43 @@ impl SessionRegistry {
             .map_err(|error| AppError::session_command_failed(error.to_string()))?
     }
 
-    pub async fn delete_remote_entry(
+    pub async fn delete_remote_entries(
         &self,
         session_id: &str,
-        path: String,
+        paths: Vec<String>,
+        recursive: bool,
     ) -> Result<(), AppError> {
         let commands = self.ssh_commands(session_id)?;
         let (response, receiver) = oneshot::channel();
         commands
-            .send(SessionCommand::DeleteRemoteEntry { path, response })
+            .send(SessionCommand::DeleteRemoteEntry {
+                paths,
+                recursive,
+                response,
+            })
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?;
+        receiver
+            .await
+            .map_err(|error| AppError::session_command_failed(error.to_string()))?
+    }
+
+    pub async fn change_remote_permissions(
+        &self,
+        session_id: &str,
+        paths: Vec<String>,
+        mode: u32,
+        recursive: bool,
+    ) -> Result<(), AppError> {
+        let commands = self.ssh_commands(session_id)?;
+        let (response, receiver) = oneshot::channel();
+        commands
+            .send(SessionCommand::ChangeRemotePermissions {
+                paths,
+                mode,
+                recursive,
+                response,
+            })
             .await
             .map_err(|error| AppError::session_command_failed(error.to_string()))?;
         receiver
@@ -239,18 +281,18 @@ impl SessionRegistry {
         &self,
         session_id: &str,
         direction: TransferDirection,
-        source: String,
-        target: String,
-        overwrite: bool,
+        sources: Vec<String>,
+        target_directory: String,
+        conflict_policy: TransferConflictPolicy,
     ) -> Result<TransferTask, AppError> {
         let commands = self.ssh_commands(session_id)?;
         let (response, receiver) = oneshot::channel();
         commands
             .send(SessionCommand::StartTransfer {
                 direction,
-                source,
-                target,
-                overwrite,
+                sources,
+                target_directory,
+                conflict_policy,
                 response,
             })
             .await

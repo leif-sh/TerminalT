@@ -1,6 +1,6 @@
 [package]
 name = "terminalt"
-version = "0.1.0-13"
+version = "0.1.0-14"
 description = "Local-first Windows SSH and SFTP client"
 authors = ["TerminalT Contributors"]
 license = "MIT"

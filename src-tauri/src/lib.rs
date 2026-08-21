@@ -10,6 +10,7 @@ mod network;
 mod session;
 mod settings;
 mod ssh_client;
+mod transfer_registry;
 mod tunnel;
 
 use chrono::Utc;
@@ -20,8 +21,8 @@ use models::{
     ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval, HostKeyInspection,
     JumpHostRequest, KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing,
     SaveConnectionRequest, SaveTunnelRequest, SavedSessionRequest, SessionOutputPayload,
-    SessionState, SessionStatus, SessionStatusPayload, TransferDirection, TransferTask,
-    TunnelProfile, TunnelRuntimeState, WindowState,
+    SessionState, SessionStatus, SessionStatusPayload, TransferConflictPolicy, TransferDirection,
+    TransferTask, TunnelProfile, TunnelRuntimeState, WindowState,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -353,12 +354,21 @@ async fn list_remote_directory(
     registry: State<'_, SessionRegistry>,
     session_id: String,
     path: Option<String>,
+    cursor: Option<String>,
 ) -> Result<RemoteDirectoryListing, AppError> {
     let path = path.unwrap_or_else(|| ".".to_owned());
     if path.len() > 4096 || path.contains('\0') {
         return Err(AppError::validation("远端路径无效"));
     }
-    registry.list_remote_directory(&session_id, path).await
+    if cursor
+        .as_ref()
+        .is_some_and(|value| value.parse::<usize>().is_err())
+    {
+        return Err(AppError::validation("目录加载游标无效"));
+    }
+    registry
+        .list_remote_directory(&session_id, path, cursor)
+        .await
 }
 
 fn validate_remote_name(name: &str) -> Result<String, AppError> {
@@ -382,6 +392,23 @@ fn validate_remote_path(path: &str) -> Result<String, AppError> {
         return Err(AppError::validation("远端路径无效"));
     }
     Ok(path.to_owned())
+}
+
+fn validate_destructive_remote_path(path: &str) -> Result<String, AppError> {
+    let path = validate_remote_path(path)?;
+    let slash_count = path.matches('/').count();
+    if path == "/"
+        || path == "/root"
+        || slash_count < 2
+        || (path.starts_with("/home/") && slash_count == 2)
+    {
+        return Err(AppError::sftp(
+            "SFTP-PATH-ESCAPE",
+            "禁止删除根目录或顶级入口",
+            path,
+        ));
+    }
+    Ok(path)
 }
 
 #[tauri::command]
@@ -413,13 +440,42 @@ async fn rename_remote_entry(
 }
 
 #[tauri::command]
-async fn delete_remote_entry(
+async fn delete_remote_entries(
     registry: State<'_, SessionRegistry>,
     session_id: String,
-    path: String,
+    paths: Vec<String>,
+    recursive: bool,
 ) -> Result<(), AppError> {
-    let path = validate_remote_path(&path)?;
-    registry.delete_remote_entry(&session_id, path).await
+    if paths.is_empty() || paths.len() > 5000 {
+        return Err(AppError::validation("请选择 1～5000 个远端对象"));
+    }
+    let paths = paths
+        .iter()
+        .map(|path| validate_destructive_remote_path(path))
+        .collect::<Result<Vec<_>, AppError>>()?;
+    registry
+        .delete_remote_entries(&session_id, paths, recursive)
+        .await
+}
+
+#[tauri::command]
+async fn change_remote_permissions(
+    registry: State<'_, SessionRegistry>,
+    session_id: String,
+    paths: Vec<String>,
+    mode: u32,
+    recursive: bool,
+) -> Result<(), AppError> {
+    if paths.is_empty() || paths.len() > 5000 || mode > 0o7777 {
+        return Err(AppError::validation("权限或远端对象数量无效"));
+    }
+    let paths = paths
+        .iter()
+        .map(|path| validate_remote_path(path))
+        .collect::<Result<Vec<_>, AppError>>()?;
+    registry
+        .change_remote_permissions(&session_id, paths, mode, recursive)
+        .await
 }
 
 #[tauri::command]
@@ -427,15 +483,36 @@ async fn start_transfer(
     registry: State<'_, SessionRegistry>,
     session_id: String,
     direction: TransferDirection,
-    source: String,
-    target: String,
-    overwrite: bool,
+    sources: Vec<String>,
+    target_directory: String,
+    conflict_policy: TransferConflictPolicy,
 ) -> Result<TransferTask, AppError> {
-    if source.trim().is_empty() || target.trim().is_empty() {
-        return Err(AppError::validation("传输源和目标不能为空"));
+    if sources.is_empty()
+        || sources.len() > 5000
+        || sources
+            .iter()
+            .any(|source| source.trim().is_empty() || source.len() > 4096 || source.contains('\0'))
+        || target_directory.trim().is_empty()
+        || target_directory.len() > 4096
+        || target_directory.contains('\0')
+    {
+        return Err(AppError::validation("传输源、目标或批量数量无效"));
+    }
+    if matches!(direction, TransferDirection::Upload) {
+        validate_remote_path(&target_directory)?;
+    } else {
+        for source in &sources {
+            validate_remote_path(source)?;
+        }
     }
     registry
-        .start_transfer(&session_id, direction, source, target, overwrite)
+        .start_transfer(
+            &session_id,
+            direction,
+            sources,
+            target_directory,
+            conflict_policy,
+        )
         .await
 }
 
@@ -446,6 +523,22 @@ fn cancel_transfer(
     task_id: String,
 ) -> Result<(), AppError> {
     registry.cancel_transfer(&session_id, task_id)
+}
+
+#[tauri::command]
+fn list_transfer_tasks(
+    registry: State<'_, transfer_registry::TransferRegistry>,
+    session_id: String,
+) -> Result<Vec<TransferTask>, AppError> {
+    registry.list(&session_id)
+}
+
+#[tauri::command]
+fn clear_completed_transfers(
+    registry: State<'_, transfer_registry::TransferRegistry>,
+    session_id: String,
+) -> Result<(), AppError> {
+    registry.clear_finished(&session_id)
 }
 
 #[tauri::command]
@@ -959,6 +1052,9 @@ pub fn run() {
                 credentials::system_vault(),
             ));
             app.manage(settings::SettingsStore::new(data_dir.join("settings.json")));
+            app.manage(transfer_registry::TransferRegistry::new(
+                data_dir.join("transfers.json"),
+            ));
             let diagnostics = diagnostics::DiagnosticLog::new(data_dir.join("logs"));
             diagnostics.record(
                 "application-start",
@@ -1036,9 +1132,12 @@ pub fn run() {
             list_remote_directory,
             create_remote_directory,
             rename_remote_entry,
-            delete_remote_entry,
+            delete_remote_entries,
+            change_remote_permissions,
             start_transfer,
             cancel_transfer,
+            list_transfer_tasks,
+            clear_completed_transfers,
             inspect_ssh_host_key,
             inspect_saved_ssh_host_key,
             test_ssh_connection,
@@ -1092,7 +1191,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod sftp_validation_tests {
-    use super::{validate_remote_name, validate_remote_path};
+    use super::{validate_destructive_remote_path, validate_remote_name, validate_remote_path};
 
     #[test]
     fn remote_names_reject_path_components() {
@@ -1107,5 +1206,14 @@ mod sftp_validation_tests {
         assert!(validate_remote_path("/home/user").is_ok());
         assert!(validate_remote_path("relative/path").is_err());
         assert!(validate_remote_path("/bad\0path").is_err());
+    }
+
+    #[test]
+    fn destructive_operations_protect_root_entries() {
+        assert!(validate_destructive_remote_path("/").is_err());
+        assert!(validate_destructive_remote_path("/home").is_err());
+        assert!(validate_destructive_remote_path("/home/user").is_err());
+        assert!(validate_destructive_remote_path("/home/user/file").is_ok());
+        assert!(validate_destructive_remote_path("/tmp/file").is_ok());
     }
 }

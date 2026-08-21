@@ -23,7 +23,7 @@ import type {
   AuthenticationPromptResponse,
 } from '../domain/connection/types'
 import type { TerminalSettings } from '../domain/terminal/settings'
-import type { RemoteDirectoryListing, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
+import type { RemoteDirectoryListing, TransferConflictPolicy, TransferDirection, TransferProgressPayload, TransferTask } from '../domain/sftp/types'
 import type { SaveTunnelRequest, TunnelProfile, TunnelRuntimeState, TunnelStatusPayload } from '../domain/tunnel/types'
 
 export interface HealthResponse {
@@ -564,6 +564,7 @@ export async function closeSession(sessionId: string): Promise<void> {
 export async function listRemoteDirectory(
   sessionId: string,
   path?: string,
+  cursor?: string,
 ): Promise<RemoteDirectoryListing> {
   if (!isTauriRuntime()) {
     const directory = path ?? '/home/terminalt'
@@ -572,13 +573,13 @@ export async function listRemoteDirectory(
       parentPath: directory === '/' ? undefined : directory.slice(0, directory.lastIndexOf('/')) || '/',
       truncated: false,
       entries: [
-        { name: 'projects', path: `${directory.replace(/\/$/, '')}/projects`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwxr-xr-x' },
-        { name: '.config', path: `${directory.replace(/\/$/, '')}/.config`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwx------' },
-        { name: 'README.md', path: `${directory.replace(/\/$/, '')}/README.md`, kind: 'file', size: 1842, modifiedAt: new Date().toISOString(), permissions: '-rw-r--r--' },
+        { name: 'projects', path: `${directory.replace(/\/$/, '')}/projects`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwxr-xr-x', permissionMode: 0o755, uid: 1000, gid: 1000 },
+        { name: '.config', path: `${directory.replace(/\/$/, '')}/.config`, kind: 'directory', size: 0, modifiedAt: new Date().toISOString(), permissions: 'drwx------', permissionMode: 0o700, uid: 1000, gid: 1000 },
+        { name: 'README.md', path: `${directory.replace(/\/$/, '')}/README.md`, kind: 'file', size: 1842, modifiedAt: new Date().toISOString(), permissions: '-rw-r--r--', permissionMode: 0o644, uid: 1000, gid: 1000 },
       ],
     }
   }
-  return invoke<RemoteDirectoryListing>('list_remote_directory', { sessionId, path })
+  return invoke<RemoteDirectoryListing>('list_remote_directory', { sessionId, path, cursor })
 }
 
 export async function createRemoteDirectory(sessionId: string, parentPath: string, name: string): Promise<void> {
@@ -591,21 +592,37 @@ export async function renameRemoteEntry(sessionId: string, path: string, newName
   await invoke('rename_remote_entry', { sessionId, path, newName })
 }
 
-export async function deleteRemoteEntry(sessionId: string, path: string): Promise<void> {
+export async function deleteRemoteEntries(sessionId: string, paths: string[], recursive: boolean): Promise<void> {
   if (!isTauriRuntime()) return
-  await invoke('delete_remote_entry', { sessionId, path })
+  await invoke('delete_remote_entries', { sessionId, paths, recursive })
+}
+
+export async function changeRemotePermissions(sessionId: string, paths: string[], mode: number, recursive: boolean): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('change_remote_permissions', { sessionId, paths, mode, recursive })
 }
 
 export async function startTransfer(
-  sessionId: string, direction: TransferDirection, source: string, target: string, overwrite: boolean,
+  sessionId: string, direction: TransferDirection, sources: string[], targetDirectory: string,
+  conflictPolicy: TransferConflictPolicy,
 ): Promise<TransferTask> {
   if (!isTauriRuntime()) throw new Error('浏览器预览不支持真实文件传输')
-  return invoke<TransferTask>('start_transfer', { sessionId, direction, source, target, overwrite })
+  return invoke<TransferTask>('start_transfer', { sessionId, direction, sources, targetDirectory, conflictPolicy })
 }
 
 export async function cancelTransfer(sessionId: string, taskId: string): Promise<void> {
   if (!isTauriRuntime()) return
   await invoke('cancel_transfer', { sessionId, taskId })
+}
+
+export async function listTransferTasks(sessionId: string): Promise<TransferTask[]> {
+  if (!isTauriRuntime()) return []
+  return invoke<TransferTask[]>('list_transfer_tasks', { sessionId })
+}
+
+export async function clearCompletedTransfers(sessionId: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke('clear_completed_transfers', { sessionId })
 }
 
 export async function listenToTransferProgress(handler: TransferHandler): Promise<UnlistenFn> {

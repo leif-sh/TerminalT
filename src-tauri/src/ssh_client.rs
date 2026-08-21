@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, oneshot, Semaphore},
+    task::JoinSet,
 };
 use zeroize::Zeroizing;
 
@@ -26,7 +27,8 @@ use crate::{
         ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, HostKeyApproval,
         HostKeyInspection, JumpHostRequest, RemoteDirectoryEntry, RemoteDirectoryListing,
         RemoteEntryKind, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
-        TransferDirection, TransferProgressPayload, TransferStatus, TransferTask,
+        TransferConflictPolicy, TransferDirection, TransferProgressPayload, TransferStatus,
+        TransferTask,
     },
     network,
     session::{SessionCommand, SessionRegistry},
@@ -1077,7 +1079,7 @@ async fn run_session(
     let transfer_slots = Arc::new(Semaphore::new(3));
     let mut transfer_cancellations =
         std::collections::HashMap::<String, oneshot::Sender<()>>::new();
-    let mut transfer_handles = Vec::new();
+    let mut transfer_handles = JoinSet::new();
     let (mut reader, writer) = channel.split();
     let mut output_buffer = Vec::with_capacity(64 * 1024);
     let mut output_flush = tokio::time::interval(Duration::from_millis(16));
@@ -1101,8 +1103,8 @@ async fn run_session(
                         log::warn!("PTY resize failed for session {session_id}: {error}");
                     }
                 }
-                Some(SessionCommand::ListRemoteDirectory { path, response }) => {
-                    enqueue_sftp_request(&sftp_commands, SftpRequest::Browse { path, response });
+                Some(SessionCommand::ListRemoteDirectory { path, cursor, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::Browse { path, cursor, response });
                 }
                 Some(SessionCommand::CreateRemoteDirectory { parent_path, name, response }) => {
                     enqueue_sftp_request(&sftp_commands, SftpRequest::CreateDirectory { parent_path, name, response });
@@ -1110,11 +1112,14 @@ async fn run_session(
                 Some(SessionCommand::RenameRemoteEntry { path, new_name, response }) => {
                     enqueue_sftp_request(&sftp_commands, SftpRequest::Rename { path, new_name, response });
                 }
-                Some(SessionCommand::DeleteRemoteEntry { path, response }) => {
-                    enqueue_sftp_request(&sftp_commands, SftpRequest::Delete { path, response });
+                Some(SessionCommand::DeleteRemoteEntry { paths, recursive, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::Delete { paths, recursive, response });
                 }
-                Some(SessionCommand::StartTransfer { direction, source, target, overwrite, response }) => {
-                    let task = new_transfer_task(&session_id, direction, source, target);
+                Some(SessionCommand::ChangeRemotePermissions { paths, mode, recursive, response }) => {
+                    enqueue_sftp_request(&sftp_commands, SftpRequest::ChangePermissions { paths, mode, recursive, response });
+                }
+                Some(SessionCommand::StartTransfer { direction, sources, target_directory, conflict_policy, response }) => {
+                    let task = new_transfer_task(&session_id, direction, sources, target_directory, conflict_policy);
                     let (cancel, cancellation) = oneshot::channel();
                     transfer_cancellations.insert(task.id.clone(), cancel);
                     let _ = response.send(Ok(task.clone()));
@@ -1122,9 +1127,11 @@ async fn run_session(
                     let transfer_app = app.clone();
                     let transfer_handle = Arc::clone(&handle);
                     let transfer_slots = Arc::clone(&transfer_slots);
-                    transfer_handles.push(tauri::async_runtime::spawn(async move {
-                        run_transfer(transfer_app, transfer_handle, transfer_slots, task, overwrite, cancellation).await;
-                    }));
+                    let task_id = task.id.clone();
+                    transfer_handles.spawn(async move {
+                        run_transfer(transfer_app, transfer_handle, transfer_slots, task, cancellation).await;
+                        task_id
+                    });
                 }
                 Some(SessionCommand::CancelTransfer { task_id }) => {
                     if let Some(cancellation) = transfer_cancellations.remove(&task_id) {
@@ -1148,6 +1155,11 @@ async fn run_session(
                     break "会话已关闭".to_owned();
                 }
             },
+            completed = transfer_handles.join_next(), if !transfer_handles.is_empty() => {
+                if let Some(Ok(task_id)) = completed {
+                    transfer_cancellations.remove(&task_id);
+                }
+            }
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     output_buffer.extend_from_slice(&data);
@@ -1184,9 +1196,7 @@ async fn run_session(
         let _ = cancellation.send(());
     }
     let _ = tokio::time::timeout(Duration::from_millis(1200), async {
-        for transfer in transfer_handles {
-            let _ = transfer.await;
-        }
+        while transfer_handles.join_next().await.is_some() {}
     })
     .await;
     drop(handle);
@@ -1210,6 +1220,7 @@ async fn run_session(
 enum SftpRequest {
     Browse {
         path: String,
+        cursor: Option<String>,
         response: tokio::sync::oneshot::Sender<Result<RemoteDirectoryListing, AppError>>,
     },
     CreateDirectory {
@@ -1223,7 +1234,14 @@ enum SftpRequest {
         response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
     },
     Delete {
-        path: String,
+        paths: Vec<String>,
+        recursive: bool,
+        response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    },
+    ChangePermissions {
+        paths: Vec<String>,
+        mode: u32,
+        recursive: bool,
         response: tokio::sync::oneshot::Sender<Result<(), AppError>>,
     },
 }
@@ -1243,7 +1261,8 @@ fn enqueue_sftp_request(sender: &mpsc::Sender<SftpRequest>, request: SftpRequest
             }
             SftpRequest::CreateDirectory { response, .. }
             | SftpRequest::Rename { response, .. }
-            | SftpRequest::Delete { response, .. } => {
+            | SftpRequest::Delete { response, .. }
+            | SftpRequest::ChangePermissions { response, .. } => {
                 let _ = response.send(Err(failure()));
             }
         }
@@ -1257,8 +1276,13 @@ async fn run_sftp_worker(
     let mut sftp = None;
     while let Some(request) = requests.recv().await {
         match request {
-            SftpRequest::Browse { path, response } => {
-                let _ = response.send(browse_remote_directory(&handle, &mut sftp, path).await);
+            SftpRequest::Browse {
+                path,
+                cursor,
+                response,
+            } => {
+                let _ =
+                    response.send(browse_remote_directory(&handle, &mut sftp, path, cursor).await);
             }
             SftpRequest::CreateDirectory {
                 parent_path,
@@ -1276,8 +1300,23 @@ async fn run_sftp_worker(
                 let _ =
                     response.send(rename_remote_entry(&handle, &mut sftp, path, new_name).await);
             }
-            SftpRequest::Delete { path, response } => {
-                let _ = response.send(delete_remote_entry(&handle, &mut sftp, path).await);
+            SftpRequest::Delete {
+                paths,
+                recursive,
+                response,
+            } => {
+                let _ = response
+                    .send(delete_remote_entries(&handle, &mut sftp, paths, recursive).await);
+            }
+            SftpRequest::ChangePermissions {
+                paths,
+                mode,
+                recursive,
+                response,
+            } => {
+                let _ = response.send(
+                    change_remote_permissions(&handle, &mut sftp, paths, mode, recursive).await,
+                );
             }
         }
     }
@@ -1299,11 +1338,11 @@ async fn ensure_sftp_session<'a>(
             .request_subsystem(true, "sftp")
             .await
             .map_err(map_sftp_ssh_error)?;
-        *sftp = Some(
-            SftpSession::new(channel.into_stream())
-                .await
-                .map_err(map_sftp_error)?,
-        );
+        let session = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(map_sftp_error)?;
+        session.set_timeout(1);
+        *sftp = Some(session);
     }
     Ok(sftp.as_ref().expect("SFTP session initialized above"))
 }
@@ -1312,6 +1351,7 @@ async fn browse_remote_directory(
     handle: &client::Handle<VerifiedHandler>,
     sftp: &mut Option<SftpSession>,
     requested_path: String,
+    cursor: Option<String>,
 ) -> Result<RemoteDirectoryListing, AppError> {
     let session = ensure_sftp_session(handle, sftp).await?;
     let result = async {
@@ -1319,40 +1359,57 @@ async fn browse_remote_directory(
             .canonicalize(requested_path)
             .await
             .map_err(map_sftp_error)?;
-        let mut entries = session
+        let raw_entries = session
             .read_dir(path.clone())
             .await
             .map_err(map_sftp_error)?
-            .map(|entry| {
-                let metadata = entry.metadata();
-                let file_type = entry.file_type();
-                RemoteDirectoryEntry {
-                    name: entry.file_name(),
-                    path: entry.path(),
-                    kind: match file_type {
-                        FileType::Dir => RemoteEntryKind::Directory,
-                        FileType::File => RemoteEntryKind::File,
-                        FileType::Symlink => RemoteEntryKind::Symlink,
-                        FileType::Other => RemoteEntryKind::Other,
-                    },
-                    size: metadata.size.unwrap_or(0),
-                    modified_at: metadata
-                        .modified()
-                        .ok()
-                        .map(|value| chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()),
-                    permissions: format!(
-                        "{}{}",
-                        match file_type {
-                            FileType::Dir => "d",
-                            FileType::File => "-",
-                            FileType::Symlink => "l",
-                            FileType::Other => "?",
-                        },
-                        metadata.permissions()
-                    ),
-                }
-            })
             .collect::<Vec<_>>();
+        if raw_entries.len() > 100_000 {
+            return Err(AppError::sftp(
+                "SFTP-RECURSIVE-LIMIT",
+                "远端目录条目超过安全上限",
+                "directory contains more than 100000 entries",
+            ));
+        }
+        let mut entries = Vec::with_capacity(raw_entries.len());
+        for entry in raw_entries {
+            let metadata = entry.metadata();
+            let file_type = entry.file_type();
+            let entry_path = entry.path();
+            entries.push(RemoteDirectoryEntry {
+                name: entry.file_name(),
+                path: entry_path.clone(),
+                kind: match file_type {
+                    FileType::Dir => RemoteEntryKind::Directory,
+                    FileType::File => RemoteEntryKind::File,
+                    FileType::Symlink => RemoteEntryKind::Symlink,
+                    FileType::Other => RemoteEntryKind::Other,
+                },
+                size: metadata.size.unwrap_or(0),
+                modified_at: metadata
+                    .modified()
+                    .ok()
+                    .map(|value| chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()),
+                permissions: format!(
+                    "{}{}",
+                    match file_type {
+                        FileType::Dir => "d",
+                        FileType::File => "-",
+                        FileType::Symlink => "l",
+                        FileType::Other => "?",
+                    },
+                    metadata.permissions()
+                ),
+                permission_mode: metadata.permissions.map(|mode| mode & 0o7777),
+                uid: metadata.uid,
+                gid: metadata.gid,
+                symlink_target: if file_type == FileType::Symlink {
+                    session.read_link(entry_path).await.ok()
+                } else {
+                    None
+                },
+            });
+        }
         entries.sort_by(|left, right| {
             let left_directory = left.kind == RemoteEntryKind::Directory;
             let right_directory = right.kind == RemoteEntryKind::Directory;
@@ -1360,13 +1417,25 @@ async fn browse_remote_directory(
                 .cmp(&left_directory)
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
-        let truncated = entries.len() > 5000;
-        entries.truncate(5000);
+        let offset = cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<usize>()
+            .map_err(|_| AppError::validation("目录加载游标无效"))?;
+        let total = entries.len();
+        let page = entries
+            .into_iter()
+            .skip(offset)
+            .take(1000)
+            .collect::<Vec<_>>();
+        let next_offset = offset.saturating_add(page.len());
+        let next_cursor = (next_offset < total).then(|| next_offset.to_string());
         Ok(RemoteDirectoryListing {
             parent_path: parent_remote_path(&path),
             path,
-            entries,
-            truncated,
+            entries: page,
+            truncated: next_cursor.is_some(),
+            next_cursor,
         })
     }
     .await;
@@ -1431,40 +1500,130 @@ async fn rename_remote_entry(
     session.rename(path, target).await.map_err(map_sftp_error)
 }
 
-async fn delete_remote_entry(
+async fn delete_remote_entries(
     handle: &client::Handle<VerifiedHandler>,
     sftp: &mut Option<SftpSession>,
-    path: String,
+    paths: Vec<String>,
+    recursive: bool,
 ) -> Result<(), AppError> {
     let session = ensure_sftp_session(handle, sftp).await?;
-    let metadata = session
-        .symlink_metadata(path.clone())
-        .await
-        .map_err(map_sftp_error)?;
-    match metadata.file_type() {
-        FileType::Dir => {
-            let mut entries = session
-                .read_dir(path.clone())
-                .await
-                .map_err(map_sftp_error)?;
-            if entries.next().is_some() {
+    let mut plan = Vec::new();
+    for path in paths {
+        let metadata = session
+            .symlink_metadata(path.clone())
+            .await
+            .map_err(map_sftp_error)?;
+        if metadata.file_type() == FileType::Dir && recursive {
+            plan.extend(scan_remote_tree(session, path, true).await?);
+        } else {
+            plan.push((path, metadata.file_type(), 0));
+        }
+    }
+    plan.sort_by(|left, right| right.2.cmp(&left.2));
+    for (path, kind, _) in plan {
+        match kind {
+            FileType::Dir => session.remove_dir(path).await.map_err(map_sftp_error)?,
+            FileType::File | FileType::Symlink => {
+                session.remove_file(path).await.map_err(map_sftp_error)?
+            }
+            FileType::Other => {
                 return Err(AppError::sftp(
-                    "SFTP-DIRECTORY-NOT-EMPTY",
-                    "基础版不支持删除非空目录",
+                    "SFTP-UNSUPPORTED-ENTRY",
+                    "不支持删除此类型的远端对象",
                     path,
                 ));
             }
-            session.remove_dir(path).await.map_err(map_sftp_error)
         }
-        FileType::File | FileType::Symlink => {
-            session.remove_file(path).await.map_err(map_sftp_error)
-        }
-        FileType::Other => Err(AppError::sftp(
-            "SFTP-UNSUPPORTED-ENTRY",
-            "不支持删除此类型的远端对象",
-            path,
-        )),
     }
+    Ok(())
+}
+
+async fn change_remote_permissions(
+    handle: &client::Handle<VerifiedHandler>,
+    sftp: &mut Option<SftpSession>,
+    paths: Vec<String>,
+    mode: u32,
+    recursive: bool,
+) -> Result<(), AppError> {
+    let session = ensure_sftp_session(handle, sftp).await?;
+    let mut targets = Vec::new();
+    for path in paths {
+        let metadata = session
+            .symlink_metadata(path.clone())
+            .await
+            .map_err(map_sftp_error)?;
+        if recursive && metadata.file_type() == FileType::Dir {
+            targets.extend(scan_remote_tree(session, path, false).await?);
+        } else {
+            targets.push((path, metadata.file_type(), 0));
+        }
+    }
+    for (path, kind, _) in targets {
+        if kind == FileType::Symlink {
+            continue;
+        }
+        let attributes = russh_sftp::protocol::FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        };
+        session
+            .set_metadata(path.clone(), attributes)
+            .await
+            .map_err(|error| {
+                AppError::sftp(
+                    "SFTP-PERMISSION-CHANGE-FAILED",
+                    "无法修改远端权限",
+                    format!("path={path}: {error}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn scan_remote_tree(
+    session: &SftpSession,
+    root: String,
+    include_symlinks: bool,
+) -> Result<Vec<(String, FileType, usize)>, AppError> {
+    const MAX_DEPTH: usize = 64;
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_PENDING: usize = 10_000;
+    let root_prefix = format!("{}/", root.trim_end_matches('/'));
+    let mut pending = vec![(root.clone(), 0_usize)];
+    let mut result = Vec::new();
+    while let Some((path, depth)) = pending.pop() {
+        if depth > MAX_DEPTH || result.len() >= MAX_ENTRIES || pending.len() > MAX_PENDING {
+            return Err(AppError::sftp(
+                "SFTP-RECURSIVE-LIMIT",
+                "递归操作超过安全上限",
+                format!("root={root} depth={depth} entries={}", result.len()),
+            ));
+        }
+        let metadata = session
+            .symlink_metadata(path.clone())
+            .await
+            .map_err(map_sftp_error)?;
+        let kind = metadata.file_type();
+        if path != root && !path.starts_with(&root_prefix) {
+            return Err(AppError::sftp(
+                "SFTP-PATH-ESCAPE",
+                "远端路径越过所选根目录",
+                format!("root={root} path={path}"),
+            ));
+        }
+        result.push((path.clone(), kind, depth));
+        if kind == FileType::Dir {
+            let entries = session.read_dir(path).await.map_err(map_sftp_error)?;
+            for entry in entries {
+                let entry_kind = entry.file_type();
+                if entry_kind == FileType::Symlink && !include_symlinks {
+                    continue;
+                }
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn join_remote_path(parent: &str, name: &str) -> String {
@@ -1478,32 +1637,56 @@ fn join_remote_path(parent: &str, name: &str) -> String {
 fn new_transfer_task(
     session_id: &str,
     direction: TransferDirection,
-    source: String,
-    target: String,
+    sources: Vec<String>,
+    target_directory: String,
+    conflict_policy: TransferConflictPolicy,
 ) -> TransferTask {
-    let file_name = match direction {
-        TransferDirection::Upload => std::path::Path::new(&source).file_name(),
-        TransferDirection::Download => std::path::Path::new(&target).file_name(),
-    }
-    .and_then(|value| value.to_str())
-    .unwrap_or("未命名文件")
-    .to_owned();
+    let file_name = if sources.len() == 1 {
+        transfer_source_name(&sources[0], direction).unwrap_or_else(|| "未命名对象".to_owned())
+    } else {
+        format!("{} 个对象", sources.len())
+    };
     TransferTask {
         id: uuid::Uuid::new_v4().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
         session_id: session_id.to_owned(),
         file_name,
         direction,
-        source,
-        target,
+        source: sources.first().cloned().unwrap_or_default(),
+        target: target_directory.clone(),
+        sources,
+        target_directory,
+        conflict_policy,
         transferred_bytes: 0,
         total_bytes: None,
+        total_files: 0,
+        total_directories: 0,
+        completed_files: 0,
+        completed_directories: 0,
+        skipped_files: 0,
         bytes_per_second: 0,
+        current_path: None,
+        elapsed_seconds: 0,
         status: TransferStatus::Queued,
         error: None,
+        errors: Vec::new(),
     }
 }
 
 fn emit_transfer(app: &AppHandle, task: TransferTask) {
+    let persist = matches!(
+        task.status,
+        TransferStatus::Queued
+            | TransferStatus::Completed
+            | TransferStatus::Failed
+            | TransferStatus::Cancelled
+    );
+    if let Err(error) = app
+        .state::<crate::transfer_registry::TransferRegistry>()
+        .record(task.clone(), persist)
+    {
+        log::error!("{}: {}", error.code, error.message);
+    }
     let _ = app.emit(TRANSFER_PROGRESS_EVENT, TransferProgressPayload { task });
 }
 
@@ -1512,7 +1695,6 @@ async fn run_transfer(
     handle: Arc<client::Handle<VerifiedHandler>>,
     slots: Arc<Semaphore>,
     mut task: TransferTask,
-    overwrite: bool,
     mut cancellation: oneshot::Receiver<()>,
 ) {
     let permit = tokio::select! {
@@ -1523,42 +1705,25 @@ async fn run_transfer(
             return;
         }
     };
-    task.status = TransferStatus::Running;
+    task.status = TransferStatus::Scanning;
     emit_transfer(&app, task.clone());
     let started = Instant::now();
-    let result = match task.direction {
-        TransferDirection::Upload => {
-            upload_file(
-                &app,
-                &handle,
-                &mut task,
-                overwrite,
-                &mut cancellation,
-                started,
-            )
-            .await
-        }
-        TransferDirection::Download => {
-            download_file(
-                &app,
-                &handle,
-                &mut task,
-                overwrite,
-                &mut cancellation,
-                started,
-            )
-            .await
-        }
-    };
+    let result = execute_transfer_job(&app, &handle, &mut task, &mut cancellation, started).await;
     drop(permit);
     match result {
-        Ok(()) => task.status = TransferStatus::Succeeded,
+        Ok(()) if task.errors.is_empty() => task.status = TransferStatus::Completed,
+        Ok(()) => {
+            task.status = TransferStatus::Failed;
+            task.error = Some(format!("{} 个项目失败", task.errors.len()));
+        }
         Err(error) if error.code == "TRANSFER-CANCELLED" => task.status = TransferStatus::Cancelled,
         Err(error) => {
             task.status = TransferStatus::Failed;
             task.error = Some(error.message);
         }
     }
+    task.current_path = None;
+    task.elapsed_seconds = started.elapsed().as_secs();
     app.state::<crate::diagnostics::DiagnosticLog>().record(
         "sftp-transfer",
         task.error.as_deref(),
@@ -1568,6 +1733,515 @@ async fn run_transfer(
         ),
     );
     emit_transfer(&app, task);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferItemKind {
+    Directory,
+    File,
+}
+
+struct TransferItem {
+    source: String,
+    target: String,
+    kind: TransferItemKind,
+    modified_at: Option<u32>,
+}
+
+struct TransferPlan {
+    items: Vec<TransferItem>,
+    files: u64,
+    directories: u64,
+    bytes: u64,
+    skipped: u64,
+}
+
+async fn execute_transfer_job(
+    app: &AppHandle,
+    handle: &client::Handle<VerifiedHandler>,
+    task: &mut TransferTask,
+    cancellation: &mut oneshot::Receiver<()>,
+    started: Instant,
+) -> Result<(), AppError> {
+    let plan = match task.direction {
+        TransferDirection::Upload => scan_local_sources(task, cancellation).await?,
+        TransferDirection::Download => scan_remote_sources(handle, task, cancellation).await?,
+    };
+    task.total_files = plan.files;
+    task.total_directories = plan.directories;
+    task.total_bytes = Some(plan.bytes);
+    task.skipped_files = plan.skipped;
+    task.status = TransferStatus::Running;
+    emit_transfer(app, task.clone());
+
+    for item in plan.items {
+        if cancellation.try_recv().is_ok() {
+            return Err(cancelled_error());
+        }
+        task.current_path = Some(item.source.clone());
+        task.source = item.source.clone();
+        task.target = item.target.clone();
+        let result = match (task.direction, item.kind) {
+            (TransferDirection::Upload, TransferItemKind::Directory) => {
+                ensure_remote_directory(handle, &item.target).await
+            }
+            (TransferDirection::Download, TransferItemKind::Directory) => {
+                tokio::fs::create_dir_all(&item.target)
+                    .await
+                    .map_err(|error| {
+                        AppError::sftp("LOCAL-WRITE-FAILED", "无法创建本地目录", error.to_string())
+                    })
+            }
+            (TransferDirection::Upload, TransferItemKind::File) => {
+                let target =
+                    resolve_remote_conflict(handle, &item.target, task.conflict_policy).await?;
+                if let Some(target) = target {
+                    task.target = target;
+                    let result = upload_file(app, handle, task, true, cancellation, started).await;
+                    if result.is_ok() {
+                        set_remote_modified_time(handle, &task.target, item.modified_at).await
+                    } else {
+                        result
+                    }
+                } else {
+                    task.skipped_files += 1;
+                    continue;
+                }
+            }
+            (TransferDirection::Download, TransferItemKind::File) => {
+                let target = resolve_local_conflict(&item.target, task.conflict_policy).await?;
+                if let Some(target) = target {
+                    task.target = target;
+                    let result =
+                        download_file(app, handle, task, true, cancellation, started).await;
+                    if result.is_ok() {
+                        set_local_modified_time(task.target.clone(), item.modified_at).await
+                    } else {
+                        result
+                    }
+                } else {
+                    task.skipped_files += 1;
+                    continue;
+                }
+            }
+        };
+        match result {
+            Ok(()) if item.kind == TransferItemKind::Directory => task.completed_directories += 1,
+            Ok(()) => task.completed_files += 1,
+            Err(error) if error.code == "TRANSFER-CANCELLED" => return Err(error),
+            Err(error) => {
+                if task.errors.len() < 20 {
+                    task.errors.push(format!(
+                        "{} [{}]: {}",
+                        item.source, error.code, error.message
+                    ));
+                }
+            }
+        }
+        task.elapsed_seconds = started.elapsed().as_secs();
+        update_transfer_progress(app, task, started);
+    }
+    Ok(())
+}
+
+fn transfer_source_name(source: &str, direction: TransferDirection) -> Option<String> {
+    match direction {
+        TransferDirection::Upload => std::path::Path::new(source)
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned()),
+        TransferDirection::Download => source
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+    }
+}
+
+async fn scan_local_sources(
+    task: &TransferTask,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<TransferPlan, AppError> {
+    const MAX_DEPTH: usize = 64;
+    const MAX_ENTRIES: usize = 100_000;
+    let mut pending = Vec::new();
+    for source in &task.sources {
+        let name = transfer_source_name(source, TransferDirection::Upload).ok_or_else(|| {
+            AppError::sftp("TRANSFER-SCAN-FAILED", "无法确定本地对象名称", source)
+        })?;
+        pending.push((
+            std::path::PathBuf::from(source),
+            join_remote_path(&task.target_directory, &name),
+            0_usize,
+        ));
+    }
+    let mut plan = TransferPlan {
+        items: Vec::new(),
+        files: 0,
+        directories: 0,
+        bytes: 0,
+        skipped: 0,
+    };
+    while let Some((source, target, depth)) = pending.pop() {
+        if cancellation.try_recv().is_ok() {
+            return Err(cancelled_error());
+        }
+        if depth > MAX_DEPTH || plan.items.len() >= MAX_ENTRIES || pending.len() > 10_000 {
+            return Err(recursive_limit_error(depth, plan.items.len()));
+        }
+        if target.len() > 4096 {
+            return Err(AppError::sftp(
+                "TRANSFER-SCAN-FAILED",
+                "远端目标路径超过长度限制",
+                target,
+            ));
+        }
+        let metadata = tokio::fs::symlink_metadata(&source)
+            .await
+            .map_err(|error| {
+                AppError::sftp(
+                    "TRANSFER-SCAN-FAILED",
+                    "无法扫描本地对象",
+                    format!("{}: {error}", source.display()),
+                )
+            })?;
+        if metadata.file_type().is_symlink() {
+            plan.skipped += 1;
+            continue;
+        }
+        if metadata.is_dir() {
+            plan.directories += 1;
+            plan.items.push(TransferItem {
+                source: source.display().to_string(),
+                target: target.clone(),
+                kind: TransferItemKind::Directory,
+                modified_at: modified_timestamp(&metadata),
+            });
+            let mut entries = tokio::fs::read_dir(&source).await.map_err(|error| {
+                AppError::sftp(
+                    "TRANSFER-SCAN-FAILED",
+                    "无法读取本地目录",
+                    format!("{}: {error}", source.display()),
+                )
+            })?;
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                AppError::sftp(
+                    "TRANSFER-SCAN-FAILED",
+                    "无法扫描本地目录",
+                    error.to_string(),
+                )
+            })? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                pending.push((entry.path(), join_remote_path(&target, &name), depth + 1));
+            }
+        } else if metadata.is_file() {
+            plan.files += 1;
+            plan.bytes = plan.bytes.saturating_add(metadata.len());
+            plan.items.push(TransferItem {
+                source: source.display().to_string(),
+                target,
+                kind: TransferItemKind::File,
+                modified_at: modified_timestamp(&metadata),
+            });
+        } else {
+            plan.skipped += 1;
+        }
+    }
+    plan.items
+        .sort_by_key(|item| item.kind != TransferItemKind::Directory);
+    Ok(plan)
+}
+
+async fn scan_remote_sources(
+    handle: &client::Handle<VerifiedHandler>,
+    task: &TransferTask,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<TransferPlan, AppError> {
+    const MAX_DEPTH: usize = 64;
+    const MAX_ENTRIES: usize = 100_000;
+    let sftp = open_transfer_sftp(handle).await?;
+    let mut pending = Vec::new();
+    for source in &task.sources {
+        let name = transfer_source_name(source, TransferDirection::Download).ok_or_else(|| {
+            AppError::sftp("TRANSFER-SCAN-FAILED", "无法确定远端对象名称", source)
+        })?;
+        pending.push((
+            source.clone(),
+            std::path::PathBuf::from(&task.target_directory).join(name),
+            0_usize,
+        ));
+    }
+    let mut plan = TransferPlan {
+        items: Vec::new(),
+        files: 0,
+        directories: 0,
+        bytes: 0,
+        skipped: 0,
+    };
+    while let Some((source, target, depth)) = pending.pop() {
+        if cancellation.try_recv().is_ok() {
+            let _ = sftp.close().await;
+            return Err(cancelled_error());
+        }
+        if depth > MAX_DEPTH || plan.items.len() >= MAX_ENTRIES || pending.len() > 10_000 {
+            let _ = sftp.close().await;
+            return Err(recursive_limit_error(depth, plan.items.len()));
+        }
+        if source.len() > 4096 || target.as_os_str().len() > 4096 {
+            let _ = sftp.close().await;
+            return Err(AppError::sftp(
+                "TRANSFER-SCAN-FAILED",
+                "传输路径超过长度限制",
+                source,
+            ));
+        }
+        let metadata = sftp
+            .symlink_metadata(source.clone())
+            .await
+            .map_err(map_sftp_error)?;
+        match metadata.file_type() {
+            FileType::Symlink => plan.skipped += 1,
+            FileType::Dir => {
+                plan.directories += 1;
+                plan.items.push(TransferItem {
+                    source: source.clone(),
+                    target: target.display().to_string(),
+                    kind: TransferItemKind::Directory,
+                    modified_at: metadata.mtime,
+                });
+                let child_prefix = format!("{}/", source.trim_end_matches('/'));
+                let entries = sftp
+                    .read_dir(source.clone())
+                    .await
+                    .map_err(map_sftp_error)?;
+                for entry in entries {
+                    let entry_path = entry.path();
+                    if !entry_path.starts_with(&child_prefix) {
+                        let _ = sftp.close().await;
+                        return Err(AppError::sftp(
+                            "SFTP-PATH-ESCAPE",
+                            "远端目录返回了根路径以外的对象",
+                            entry_path,
+                        ));
+                    }
+                    pending.push((entry_path, target.join(entry.file_name()), depth + 1));
+                }
+            }
+            FileType::File => {
+                let size = metadata.size.unwrap_or(0);
+                plan.files += 1;
+                plan.bytes = plan.bytes.saturating_add(size);
+                plan.items.push(TransferItem {
+                    source,
+                    target: target.display().to_string(),
+                    kind: TransferItemKind::File,
+                    modified_at: metadata.mtime,
+                });
+            }
+            FileType::Other => plan.skipped += 1,
+        }
+    }
+    let _ = sftp.close().await;
+    plan.items
+        .sort_by_key(|item| item.kind != TransferItemKind::Directory);
+    Ok(plan)
+}
+
+fn recursive_limit_error(depth: usize, entries: usize) -> AppError {
+    AppError::sftp(
+        "SFTP-RECURSIVE-LIMIT",
+        "递归传输超过安全上限",
+        format!("depth={depth} entries={entries}"),
+    )
+}
+
+fn modified_timestamp(metadata: &std::fs::Metadata) -> Option<u32> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .try_into()
+        .ok()
+}
+
+async fn set_remote_modified_time(
+    handle: &client::Handle<VerifiedHandler>,
+    path: &str,
+    modified_at: Option<u32>,
+) -> Result<(), AppError> {
+    let Some(modified_at) = modified_at else {
+        return Ok(());
+    };
+    let sftp = open_transfer_sftp(handle).await?;
+    let attributes = russh_sftp::protocol::FileAttributes {
+        mtime: Some(modified_at),
+        ..Default::default()
+    };
+    let result = sftp
+        .set_metadata(path.to_owned(), attributes)
+        .await
+        .map_err(map_sftp_error);
+    let _ = sftp.close().await;
+    result
+}
+
+async fn set_local_modified_time(path: String, modified_at: Option<u32>) -> Result<(), AppError> {
+    let Some(modified_at) = modified_at else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                AppError::sftp(
+                    "LOCAL-WRITE-FAILED",
+                    "无法恢复本地文件修改时间",
+                    error.to_string(),
+                )
+            })?;
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(u64::from(modified_at)));
+        file.set_times(times).map_err(|error| {
+            AppError::sftp(
+                "LOCAL-WRITE-FAILED",
+                "无法恢复本地文件修改时间",
+                error.to_string(),
+            )
+        })
+    })
+    .await
+    .map_err(|error| {
+        AppError::sftp(
+            "LOCAL-WRITE-FAILED",
+            "本地文件时间恢复任务失败",
+            error.to_string(),
+        )
+    })?
+}
+
+async fn ensure_remote_directory(
+    handle: &client::Handle<VerifiedHandler>,
+    path: &str,
+) -> Result<(), AppError> {
+    let sftp = open_transfer_sftp(handle).await?;
+    let result = if sftp
+        .try_exists(path.to_owned())
+        .await
+        .map_err(map_sftp_error)?
+    {
+        let metadata = sftp
+            .symlink_metadata(path.to_owned())
+            .await
+            .map_err(map_sftp_error)?;
+        if metadata.file_type() == FileType::Dir {
+            Ok(())
+        } else {
+            Err(AppError::sftp(
+                "TRANSFER-CONFLICT",
+                "远端目录路径已被文件占用",
+                path,
+            ))
+        }
+    } else {
+        sftp.create_dir(path.to_owned())
+            .await
+            .map_err(map_sftp_error)
+    };
+    let _ = sftp.close().await;
+    result
+}
+
+async fn resolve_remote_conflict(
+    handle: &client::Handle<VerifiedHandler>,
+    target: &str,
+    policy: TransferConflictPolicy,
+) -> Result<Option<String>, AppError> {
+    let sftp = open_transfer_sftp(handle).await?;
+    let exists = sftp
+        .try_exists(target.to_owned())
+        .await
+        .map_err(map_sftp_error)?;
+    let result = if !exists || matches!(policy, TransferConflictPolicy::Overwrite) {
+        Some(target.to_owned())
+    } else if matches!(policy, TransferConflictPolicy::Skip) {
+        None
+    } else if matches!(policy, TransferConflictPolicy::Rename) {
+        let mut selected = None;
+        for index in 1..=999 {
+            let candidate = conflict_name(target, index);
+            if !sftp
+                .try_exists(candidate.clone())
+                .await
+                .map_err(map_sftp_error)?
+            {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        Some(
+            selected
+                .ok_or_else(|| AppError::sftp("TRANSFER-CONFLICT", "无法生成无冲突名称", target))?,
+        )
+    } else {
+        let _ = sftp.close().await;
+        return Err(AppError::sftp(
+            "TRANSFER-CONFLICT",
+            "目标已存在，请选择覆盖、跳过或自动重命名",
+            target,
+        ));
+    };
+    let _ = sftp.close().await;
+    Ok(result)
+}
+
+async fn resolve_local_conflict(
+    target: &str,
+    policy: TransferConflictPolicy,
+) -> Result<Option<String>, AppError> {
+    if !tokio::fs::try_exists(target).await.map_err(|error| {
+        AppError::sftp("LOCAL-WRITE-FAILED", "无法检查本地目标", error.to_string())
+    })? || matches!(policy, TransferConflictPolicy::Overwrite)
+    {
+        return Ok(Some(target.to_owned()));
+    }
+    if matches!(policy, TransferConflictPolicy::Skip) {
+        return Ok(None);
+    }
+    if matches!(policy, TransferConflictPolicy::Rename) {
+        for index in 1..=999 {
+            let candidate = conflict_name(target, index);
+            if !tokio::fs::try_exists(&candidate).await.map_err(|error| {
+                AppError::sftp("LOCAL-WRITE-FAILED", "无法检查本地目标", error.to_string())
+            })? {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    Err(AppError::sftp(
+        "TRANSFER-CONFLICT",
+        "目标已存在，请选择覆盖、跳过或自动重命名",
+        target,
+    ))
+}
+
+fn conflict_name(path: &str, index: usize) -> String {
+    let path = std::path::Path::new(path);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let extension = path.extension().and_then(|value| value.to_str());
+    let name = match extension {
+        Some(extension) => format!("{stem} ({index}).{extension}"),
+        None => format!("{stem} ({index})"),
+    };
+    path.with_file_name(name)
+        .display()
+        .to_string()
+        .replace('\\', "/")
 }
 
 async fn open_transfer_sftp(
@@ -1637,19 +2311,13 @@ async fn upload_file(
     let mut local = tokio::fs::File::open(&task.source).await.map_err(|error| {
         AppError::sftp("LOCAL-READ-FAILED", "无法读取本地文件", error.to_string())
     })?;
-    task.total_bytes = Some(
-        local
-            .metadata()
-            .await
-            .map_err(|error| {
-                AppError::sftp(
-                    "LOCAL-READ-FAILED",
-                    "无法读取本地文件信息",
-                    error.to_string(),
-                )
-            })?
-            .len(),
-    );
+    let _ = local.metadata().await.map_err(|error| {
+        AppError::sftp(
+            "LOCAL-READ-FAILED",
+            "无法读取本地文件信息",
+            error.to_string(),
+        )
+    })?;
     let sftp = open_transfer_sftp(handle).await?;
     if !overwrite
         && sftp
@@ -1693,12 +2361,19 @@ async fn upload_file(
         if let Err(error) =
             replace_remote_file(&sftp, &temporary, &task.target, &task.id, overwrite).await
         {
-            let _ = sftp.remove_file(temporary).await;
+            if let Err(cleanup) = sftp.remove_file(temporary).await {
+                log::warn!("remote transfer cleanup failed: {cleanup}");
+            }
             let _ = sftp.close().await;
             return Err(error);
         }
-    } else {
-        let _ = sftp.remove_file(temporary).await;
+    } else if let Err(error) = sftp.remove_file(temporary).await {
+        let _ = sftp.close().await;
+        return Err(AppError::sftp(
+            "TRANSFER-TEMP-CLEANUP-FAILED",
+            "传输失败且无法清理远端临时文件",
+            error.to_string(),
+        ));
     }
     let _ = sftp.close().await;
     result
@@ -1726,13 +2401,9 @@ async fn download_file(
     }
     let temporary = temporary_local_path(&target, &task.id);
     let sftp = open_transfer_sftp(handle).await?;
-    task.total_bytes = Some(
-        sftp.metadata(task.source.clone())
-            .await
-            .map_err(map_sftp_error)?
-            .size
-            .unwrap_or(0),
-    );
+    sftp.metadata(task.source.clone())
+        .await
+        .map_err(map_sftp_error)?;
     let mut remote = sftp
         .open(task.source.clone())
         .await
@@ -1767,12 +2438,19 @@ async fn download_file(
     let _ = local.shutdown().await;
     if result.is_ok() {
         if let Err(error) = replace_local_file(&temporary, &target, &task.id, overwrite).await {
-            let _ = tokio::fs::remove_file(&temporary).await;
+            if let Err(cleanup) = tokio::fs::remove_file(&temporary).await {
+                log::warn!("local transfer cleanup failed: {cleanup}");
+            }
             let _ = sftp.close().await;
             return Err(error);
         }
-    } else {
-        let _ = tokio::fs::remove_file(&temporary).await;
+    } else if let Err(error) = tokio::fs::remove_file(&temporary).await {
+        let _ = sftp.close().await;
+        return Err(AppError::sftp(
+            "TRANSFER-TEMP-CLEANUP-FAILED",
+            "传输失败且无法清理本地临时文件",
+            error.to_string(),
+        ));
     }
     let _ = sftp.close().await;
     result
@@ -1806,10 +2484,20 @@ async fn replace_remote_file(
         if exists {
             let _ = sftp.rename(backup, target.to_owned()).await;
         }
-        return Err(map_sftp_error(error));
+        return Err(AppError::sftp(
+            "TRANSFER-ATOMIC-REPLACE-FAILED",
+            "无法原子替换远端目标文件",
+            error.to_string(),
+        ));
     }
     if exists {
-        let _ = sftp.remove_file(backup).await;
+        sftp.remove_file(backup).await.map_err(|error| {
+            AppError::sftp(
+                "TRANSFER-TEMP-CLEANUP-FAILED",
+                "无法清理远端备份文件",
+                error.to_string(),
+            )
+        })?;
     }
     Ok(())
 }
@@ -1845,13 +2533,19 @@ async fn replace_local_file(
             let _ = tokio::fs::rename(&backup, target).await;
         }
         return Err(AppError::sftp(
-            "LOCAL-WRITE-FAILED",
-            "无法完成本地文件替换",
+            "TRANSFER-ATOMIC-REPLACE-FAILED",
+            "无法原子替换本地目标文件",
             error.to_string(),
         ));
     }
     if exists {
-        let _ = tokio::fs::remove_file(backup).await;
+        tokio::fs::remove_file(backup).await.map_err(|error| {
+            AppError::sftp(
+                "TRANSFER-TEMP-CLEANUP-FAILED",
+                "无法清理本地备份文件",
+                error.to_string(),
+            )
+        })?;
     }
     Ok(())
 }
@@ -1879,7 +2573,12 @@ fn map_sftp_error(error: russh_sftp::client::error::Error) -> AppError {
 
 #[cfg(test)]
 mod sftp_tests {
-    use super::{backup_local_path, join_remote_path, parent_remote_path, temporary_local_path};
+    use super::{
+        backup_local_path, conflict_name, join_remote_path, new_transfer_task, parent_remote_path,
+        replace_local_file, resolve_local_conflict, scan_local_sources, set_local_modified_time,
+        temporary_local_path,
+    };
+    use crate::models::{TransferConflictPolicy, TransferDirection};
 
     #[test]
     fn derives_remote_parent_paths_without_escaping_root() {
@@ -1906,6 +2605,139 @@ mod sftp_tests {
             backup_local_path(target, "task").file_name().unwrap(),
             ".report.txt.terminalt-task.backup"
         );
+    }
+
+    #[test]
+    fn conflict_names_preserve_extensions_and_remote_separators() {
+        assert_eq!(conflict_name("/tmp/report.txt", 2), "/tmp/report (2).txt");
+        assert_eq!(conflict_name("/tmp/archive", 1), "/tmp/archive (1)");
+    }
+
+    #[tokio::test]
+    async fn local_recursive_scan_handles_large_unicode_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("部署 目录");
+        std::fs::create_dir_all(&root).unwrap();
+        for directory_index in 0..100 {
+            let child = root.join(format!("目录-{directory_index:03}"));
+            std::fs::create_dir_all(&child).unwrap();
+            for file_index in 0..10 {
+                let name = if directory_index == 0 && file_index == 0 {
+                    ".隐藏文件".to_owned()
+                } else {
+                    format!("文件-{file_index:02}.txt")
+                };
+                std::fs::write(child.join(name), [file_index as u8]).unwrap();
+            }
+        }
+        let mut nested = root.join("十层");
+        for depth in 0..10 {
+            nested = nested.join(format!("d{depth}"));
+            std::fs::create_dir_all(&nested).unwrap();
+        }
+        std::fs::write(nested.join("zero"), []).unwrap();
+        let task = new_transfer_task(
+            "session",
+            TransferDirection::Upload,
+            vec![root.display().to_string()],
+            "/deploy".to_owned(),
+            TransferConflictPolicy::Rename,
+        );
+        let (_cancel, mut cancellation) = tokio::sync::oneshot::channel();
+        let plan = scan_local_sources(&task, &mut cancellation).await.unwrap();
+        assert_eq!(plan.files, 1001);
+        assert_eq!(plan.directories, 112);
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.target.contains("隐藏文件")));
+        assert!(plan.items.iter().any(|item| item.target.ends_with("/zero")));
+    }
+
+    #[tokio::test]
+    async fn failed_local_atomic_replace_restores_existing_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("report.txt");
+        std::fs::write(&target, b"original").unwrap();
+        let missing = directory.path().join("missing.part");
+        assert!(replace_local_file(&missing, &target, "task", true)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn local_conflict_policies_are_deterministic() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("report.txt");
+        std::fs::write(&target, b"existing").unwrap();
+        let target = target.display().to_string();
+        assert!(resolve_local_conflict(&target, TransferConflictPolicy::Ask)
+            .await
+            .is_err());
+        assert_eq!(
+            resolve_local_conflict(&target, TransferConflictPolicy::Skip)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_local_conflict(&target, TransferConflictPolicy::Overwrite)
+                .await
+                .unwrap(),
+            Some(target.clone())
+        );
+        assert!(
+            resolve_local_conflict(&target, TransferConflictPolicy::Rename)
+                .await
+                .unwrap()
+                .unwrap()
+                .ends_with("report (1).txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_file_modified_time_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("time.txt");
+        std::fs::write(&target, b"content").unwrap();
+        let timestamp = 1_700_000_000_u32;
+        set_local_modified_time(target.display().to_string(), Some(timestamp))
+            .await
+            .unwrap();
+        let actual = std::fs::metadata(target)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(actual, u64::from(timestamp));
+    }
+
+    #[tokio::test]
+    async fn local_scan_rejects_excessive_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut root = directory.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.display().to_string();
+        for _ in 0..65 {
+            root = root.join("d");
+            std::fs::create_dir_all(&root).unwrap();
+        }
+        let task = new_transfer_task(
+            "session",
+            TransferDirection::Upload,
+            vec![source],
+            "/deploy".to_owned(),
+            TransferConflictPolicy::Ask,
+        );
+        let (_cancel, mut cancellation) = tokio::sync::oneshot::channel();
+        let error = match scan_local_sources(&task, &mut cancellation).await {
+            Ok(_) => panic!("deep tree should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "SFTP-RECURSIVE-LIMIT");
     }
 
     #[tokio::test]
