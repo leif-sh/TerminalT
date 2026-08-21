@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    connection_pool::ConnectionLease,
     error::AppError,
     models::{TunnelKind, TunnelProfile, TunnelRuntimeState, TunnelStatus, TunnelStatusPayload},
     ssh_client::VerifiedHandler,
@@ -67,14 +68,23 @@ impl TunnelRegistry {
         app: AppHandle,
         session_id: String,
         profile: TunnelProfile,
-        handle: Arc<client::Handle<VerifiedHandler>>,
-        remote_forwards: RemoteForwardTable,
+        lease: ConnectionLease,
     ) -> Result<TunnelRuntimeState, AppError> {
         if let Some(state) = self.by_profile(&profile.id)? {
             if matches!(state.status, TunnelStatus::Starting | TunnelStatus::Running) {
                 return Ok(state);
             }
         }
+        self.entries
+            .lock()
+            .map_err(|_| registry_unavailable())?
+            .retain(|_, entry| {
+                entry.state.profile_id != profile.id
+                    || matches!(
+                        entry.state.status,
+                        TunnelStatus::Starting | TunnelStatus::Running | TunnelStatus::Stopping
+                    )
+            });
         let runtime_id = uuid::Uuid::new_v4().to_string();
         let metrics = Arc::new(TunnelMetrics::default());
         let (cancellation, cancellation_receiver) = oneshot::channel();
@@ -106,7 +116,10 @@ impl TunnelRegistry {
 
         let registry = self.clone();
         let task_runtime_id = runtime_id.clone();
+        let handle = lease.handle();
+        let remote_forwards = lease.remote_forwards();
         tauri::async_runtime::spawn(async move {
+            let _lease = lease;
             let result = match profile.kind {
                 TunnelKind::Local | TunnelKind::Dynamic => {
                     run_local_listener(
@@ -151,19 +164,15 @@ impl TunnelRegistry {
         let entries = self.entries.lock().map_err(|_| registry_unavailable())?;
         Ok(entries
             .values()
-            .find(|entry| entry.state.profile_id == profile_id)
+            .filter(|entry| entry.state.profile_id == profile_id)
+            .max_by_key(|entry| match entry.state.status {
+                TunnelStatus::Running => 5,
+                TunnelStatus::Starting => 4,
+                TunnelStatus::Stopping => 3,
+                TunnelStatus::Failed => 2,
+                TunnelStatus::Stopped => 1,
+            })
             .map(snapshot))
-    }
-
-    pub fn has_active_session(&self, session_id: &str) -> Result<bool, AppError> {
-        let entries = self.entries.lock().map_err(|_| registry_unavailable())?;
-        Ok(entries.values().any(|entry| {
-            entry.state.session_id == session_id
-                && matches!(
-                    entry.state.status,
-                    TunnelStatus::Starting | TunnelStatus::Running | TunnelStatus::Stopping
-                )
-        }))
     }
 
     pub fn stop(&self, runtime_id: &str) -> Result<TunnelRuntimeState, AppError> {
@@ -232,6 +241,15 @@ impl TunnelRegistry {
             }
         }
     }
+
+    fn record_connection_error(&self, app: &AppHandle, runtime_id: &str, error: &AppError) {
+        if let Ok(mut entries) = self.entries.lock() {
+            if let Some(entry) = entries.get_mut(runtime_id) {
+                entry.state.last_error = Some(format!("{}: {}", error.code, error.message));
+                emit_state(app, &snapshot(entry));
+            }
+        }
+    }
 }
 
 async fn run_local_listener(
@@ -280,6 +298,9 @@ async fn run_local_listener(
                 };
                 let handle = Arc::clone(&handle);
                 let metrics = Arc::clone(&metrics);
+                let connection_app = app.clone();
+                let connection_registry = registry.clone();
+                let connection_runtime_id = runtime_id.to_owned();
                 let kind = profile.kind;
                 let target_host = profile.target_host.clone();
                 let target_port = profile.target_port;
@@ -300,9 +321,21 @@ async fn run_local_listener(
                         TunnelKind::Remote => Ok(()),
                     };
                     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(error) = &result {
+                        connection_registry.record_connection_error(
+                            &connection_app,
+                            &connection_runtime_id,
+                            error,
+                        );
+                    }
                     result
                 });
-            }
+            },
+            Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = joined {
+                    log::warn!("tunnel connection task failed: {error}");
+                }
+            },
         }
     }
     connections.abort_all();
@@ -600,4 +633,95 @@ fn tunnel_protocol_error(details: impl Into<String>) -> AppError {
         details,
         false,
     )
+}
+
+#[cfg(test)]
+pub(crate) async fn test_local_forward(
+    stream: TcpStream,
+    handle: Arc<client::Handle<VerifiedHandler>>,
+    target_host: String,
+    target_port: u16,
+) -> Result<(), AppError> {
+    let origin = stream.peer_addr().map_err(tunnel_io_error)?;
+    bridge_local_forward(
+        stream,
+        handle,
+        target_host,
+        target_port,
+        origin.ip().to_string(),
+        origin.port(),
+        Arc::new(TunnelMetrics::default()),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_dynamic_forward(
+    stream: TcpStream,
+    handle: Arc<client::Handle<VerifiedHandler>>,
+) -> Result<(), AppError> {
+    let origin = stream.peer_addr().map_err(tunnel_io_error)?;
+    run_socks_client(stream, handle, origin, Arc::new(TunnelMetrics::default())).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_start_remote_forward(
+    handle: Arc<client::Handle<VerifiedHandler>>,
+    forwards: RemoteForwardTable,
+    bind_host: String,
+    target_host: String,
+    target_port: u16,
+) -> Result<u16, AppError> {
+    let returned_port = handle
+        .tcpip_forward(bind_host.clone(), 0)
+        .await
+        .map_err(|error| {
+            AppError::ssh(
+                "TUNNEL-REMOTE-LISTEN-FAILED",
+                "服务器拒绝了远程监听请求",
+                error.to_string(),
+                true,
+            )
+        })?;
+    let port = u16::try_from(returned_port).map_err(|_| {
+        AppError::ssh(
+            "TUNNEL-REMOTE-LISTEN-FAILED",
+            "服务器返回了无效的远程监听端口",
+            format!("remote forwarding returned port {returned_port}"),
+            false,
+        )
+    })?;
+    forwards.lock().map_err(|_| registry_unavailable())?.insert(
+        (bind_host, returned_port),
+        RemoteForwardTarget {
+            target_host,
+            target_port,
+            metrics: Arc::new(TunnelMetrics::default()),
+        },
+    );
+    Ok(port)
+}
+
+#[cfg(test)]
+pub(crate) async fn test_stop_remote_forward(
+    handle: Arc<client::Handle<VerifiedHandler>>,
+    forwards: RemoteForwardTable,
+    bind_host: String,
+    port: u16,
+) -> Result<(), AppError> {
+    forwards
+        .lock()
+        .map_err(|_| registry_unavailable())?
+        .remove(&(bind_host.clone(), u32::from(port)));
+    handle
+        .cancel_tcpip_forward(bind_host, u32::from(port))
+        .await
+        .map_err(|error| {
+            AppError::ssh(
+                "TUNNEL-STOP-FAILED",
+                "无法撤销服务器远程监听",
+                error.to_string(),
+                true,
+            )
+        })
 }

@@ -177,6 +177,17 @@ export async function deleteTunnelProfile(tunnelId: string): Promise<void> {
   await invoke('delete_tunnel_profile', { tunnelId })
 }
 
+export async function copyTunnelProfile(tunnelId: string): Promise<TunnelProfile> {
+  if (!isTauriRuntime()) {
+    const assets = readPreviewAssets(); const source = assets.tunnels?.find((item) => item.id === tunnelId)
+    if (!source) throw new Error('隧道不存在')
+    const now = new Date().toISOString()
+    const copy = { ...source, id: crypto.randomUUID(), name: `${source.name} - 副本`, bindPort: 0, createdAt: now, updatedAt: now }
+    assets.tunnels = [...(assets.tunnels ?? []), copy]; writePreviewAssets(assets); return copy
+  }
+  return invoke<TunnelProfile>('copy_tunnel_profile', { tunnelId })
+}
+
 export async function listRuntimeTunnels(): Promise<TunnelRuntimeState[]> {
   if (!isTauriRuntime()) return []
   return invoke<TunnelRuntimeState[]>('list_runtime_tunnels')
@@ -330,6 +341,25 @@ export async function inspectSshHostKey(
     port: request.port,
     timeoutSeconds: request.timeoutSeconds,
     proxy: request.proxy,
+  })
+}
+
+export async function inspectSavedSshHostKey(
+  operationId: string,
+  connectionId: string,
+  temporarySecret: string | undefined,
+  keepalive: KeepaliveOptions,
+): Promise<HostKeyInspection> {
+  if (!isTauriRuntime()) {
+    const profile = readPreviewAssets().connections.find((item) => item.id === connectionId)
+    if (!profile) throw new Error('连接不存在')
+    return inspectSshHostKey(operationId, toPreviewRequest(profile, temporarySecret))
+  }
+  return invoke<HostKeyInspection>('inspect_saved_ssh_host_key', {
+    operationId,
+    connectionId,
+    temporarySecret,
+    keepalive,
   })
 }
 

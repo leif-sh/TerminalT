@@ -60,6 +60,8 @@
 .tunnel-session-row select, .tunnel-form-grid input, .tunnel-form-grid select { height: 36px; border: 1px solid rgba(65, 111, 170, .38); border-radius: 7px; outline: 0; padding: 0 9px; color: #cbd9e9; background: #050c17; font-size: 10px; }
 .tunnel-form-grid { max-width: 760px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .tunnel-actions { max-width: 760px; display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }.tunnel-actions > button { min-height: 36px; border: 1px solid rgba(64, 132, 235, .32); border-radius: 8px; padding: 0 13px; color: #9ab8df; background: rgba(24, 61, 111, .26); cursor: pointer; font-size: 10px; }.tunnel-actions > button.danger { color: #e79aa7; border-color: rgba(220, 81, 105, .35); }.tunnel-actions > button:disabled { opacity: .4; cursor: default; }
+.tunnel-risk { display: inline-flex; margin-top: 8px; border: 1px solid rgba(234, 179, 67, .35); border-radius: 6px; padding: 5px 8px; color: #d2ae66; background: rgba(112, 75, 16, .2); font-size: 9px; }
+.tunnel-last-error { max-width: 760px; display: grid; gap: 5px; margin-top: 12px; padding: 11px; border: 1px solid rgba(251, 113, 133, .3); border-radius: 8px; color: #e99cab; background: rgba(81, 20, 33, .28); font-size: 9px; }.tunnel-last-error strong { color: #ffc0cb; }
 .connections-panel, .settings-sidebar { width: 310px; flex: none; display: flex; flex-direction: column; padding: 24px 18px 18px; border-right: 1px solid var(--border); background: rgba(5, 13, 24, .88); }
 .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
 .panel-header h1 { margin: 3px 0 0; font-size: 20px; font-weight: 650; letter-spacing: -.02em; }

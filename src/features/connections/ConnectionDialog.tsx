@@ -23,6 +23,7 @@ import {
 import {
   cancelOperation,
   inspectSshHostKey,
+  inspectSavedSshHostKey,
   listenToConnectionProgress,
   listenToAuthenticationPrompt,
   listSshAgentIdentities,
@@ -200,7 +201,9 @@ export function ConnectionDialog({
     setOperationId(nextOperationId)
     setProgress('正在连接服务器并获取指纹…')
     try {
-      const result = await inspectSshHostKey(nextOperationId, normalizedRequest)
+      const result = draft.id
+        ? await inspectSavedSshHostKey(nextOperationId, draft.id, currentSecret(draft), keepalive)
+        : await inspectSshHostKey(nextOperationId, normalizedRequest)
       setInspection(result)
       if (result.status === 'trusted') {
         await execute(nextIntent, result, 'useTrusted')

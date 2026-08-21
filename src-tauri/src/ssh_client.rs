@@ -18,14 +18,15 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
+    connection_pool::{ConnectionLease, ConnectionPool, PooledConnection},
     error::AppError,
     known_hosts::{HostKeyIdentity, KnownHostsStore},
     models::{
         AgentIdentityInfo, AuthType, AuthenticationPromptField, AuthenticationPromptPayload,
-        ConnectionRequest, ConnectionTestResult, HostKeyApproval, HostKeyInspection,
-        RemoteDirectoryEntry, RemoteDirectoryListing, RemoteEntryKind, SessionOutputPayload,
-        SessionState, SessionStatus, SessionStatusPayload, TransferDirection,
-        TransferProgressPayload, TransferStatus, TransferTask,
+        ConnectionProgressPayload, ConnectionRequest, ConnectionTestResult, HostKeyApproval,
+        HostKeyInspection, JumpHostRequest, RemoteDirectoryEntry, RemoteDirectoryListing,
+        RemoteEntryKind, SessionOutputPayload, SessionState, SessionStatus, SessionStatusPayload,
+        TransferDirection, TransferProgressPayload, TransferStatus, TransferTask,
     },
     network,
     session::{SessionCommand, SessionRegistry},
@@ -36,6 +37,7 @@ const SESSION_OUTPUT_EVENT: &str = "session-output";
 const SESSION_STATUS_EVENT: &str = "session-status";
 const TRANSFER_PROGRESS_EVENT: &str = "transfer-progress";
 const AUTHENTICATION_PROMPT_EVENT: &str = "authentication-prompt";
+const CONNECTION_PROGRESS_EVENT: &str = "connection-progress";
 const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_INTERACTIVE_ROUNDS: usize = 16;
 const MAX_INTERACTIVE_PROMPTS: usize = 16;
@@ -175,6 +177,30 @@ pub async fn inspect_host_key(
     KnownHostsStore::new(known_hosts_path).inspect(host, port, &identity)
 }
 
+pub async fn inspect_route_host_key(
+    app: AppHandle,
+    operation_id: String,
+    mut request: ConnectionRequest,
+    known_hosts_path: PathBuf,
+) -> Result<HostKeyInspection, AppError> {
+    request.validate().map_err(AppError::validation)?;
+    let authentication_context = AuthenticationContext {
+        app: &app,
+        operation_id: &operation_id,
+    };
+    let jumps = std::mem::take(&mut request.jump_hosts);
+    let mut upstream = connect_jump_chain(jumps, Some(authentication_context)).await?;
+    emit_route_progress(
+        &app,
+        &operation_id,
+        SessionStatus::HostKeyCheck,
+        "正在获取目标服务器指纹",
+    );
+    let result = inspect_host_key_over_route(&request, upstream.last(), &known_hosts_path).await;
+    disconnect_upstream(&mut upstream, "route inspection complete").await;
+    result
+}
+
 pub async fn test_connection(
     app: AppHandle,
     operation_id: String,
@@ -187,9 +213,9 @@ pub async fn test_connection(
     let host = request.host.clone();
     let port = request.port;
     let timeout = authentication_timeout(&request);
-    let (handle, identity, _) = tokio::time::timeout(
+    let (handle, identity, _, mut upstream) = tokio::time::timeout(
         timeout,
-        connect_authenticated(
+        connect_route_authenticated(
             &mut request,
             &approval.fingerprint_sha256,
             Some(AuthenticationContext {
@@ -211,6 +237,7 @@ pub async fn test_connection(
     let _ = handle
         .disconnect(Disconnect::ByApplication, "connection test complete", "")
         .await;
+    disconnect_upstream(&mut upstream, "connection test complete").await;
 
     Ok(ConnectionTestResult {
         elapsed_millis: started_at.elapsed().as_millis(),
@@ -225,7 +252,36 @@ pub async fn start_session(
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
 ) -> Result<SessionState, AppError> {
-    start_session_with_id(app, operation_id, request, approval, known_hosts_path, None).await
+    start_session_with_id(
+        app,
+        operation_id,
+        request,
+        approval,
+        known_hosts_path,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn start_pooled_session(
+    app: AppHandle,
+    operation_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+    pool_key: String,
+) -> Result<SessionState, AppError> {
+    start_session_with_id(
+        app,
+        operation_id,
+        request,
+        approval,
+        known_hosts_path,
+        None,
+        Some(pool_key),
+    )
+    .await
 }
 
 pub async fn reconnect_session(
@@ -243,6 +299,28 @@ pub async fn reconnect_session(
         approval,
         known_hosts_path,
         Some(session_id),
+        None,
+    )
+    .await
+}
+
+pub async fn reconnect_pooled_session(
+    app: AppHandle,
+    operation_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    known_hosts_path: PathBuf,
+    session_id: String,
+    pool_key: String,
+) -> Result<SessionState, AppError> {
+    start_session_with_id(
+        app,
+        operation_id,
+        request,
+        approval,
+        known_hosts_path,
+        Some(session_id),
+        Some(pool_key),
     )
     .await
 }
@@ -254,6 +332,7 @@ async fn start_session_with_id(
     approval: HostKeyApproval,
     known_hosts_path: PathBuf,
     session_id: Option<String>,
+    pool_key: Option<String>,
 ) -> Result<SessionState, AppError> {
     request.validate().map_err(AppError::validation)?;
     let timeout = authentication_timeout(&request);
@@ -262,26 +341,71 @@ async fn start_session_with_id(
     let port = request.port;
     let columns = request.columns;
     let rows = request.rows;
-    let (handle, identity, remote_forwards) = tokio::time::timeout(
-        timeout,
-        connect_authenticated(
-            &mut request,
-            &approval.fingerprint_sha256,
-            Some(AuthenticationContext {
-                app: &app,
-                operation_id: &operation_id,
-            }),
-        ),
-    )
-    .await
-    .map_err(|_| connection_timeout())??;
-
-    KnownHostsStore::new(known_hosts_path).approve(&host, port, &identity, approval.action)?;
-
-    let channel = handle
-        .channel_open_session()
+    let pool = app.state::<ConnectionPool>();
+    let mut lease = if let Some(key) = pool_key.as_deref() {
+        pool.acquire(key)?
+    } else {
+        None
+    };
+    let mut channel = match lease.as_ref() {
+        Some(existing_lease) => match existing_lease.handle().channel_open_session().await {
+            Ok(channel) => Some(channel),
+            Err(_) => {
+                if let Some(key) = pool_key.as_deref() {
+                    pool.invalidate(key)?;
+                }
+                lease = None;
+                None
+            }
+        },
+        None => None,
+    };
+    if lease.is_none() {
+        let (handle, identity, remote_forwards, upstream) = tokio::time::timeout(
+            timeout,
+            connect_route_authenticated(
+                &mut request,
+                &approval.fingerprint_sha256,
+                Some(AuthenticationContext {
+                    app: &app,
+                    operation_id: &operation_id,
+                }),
+            ),
+        )
         .await
-        .map_err(map_russh_error)?;
+        .map_err(|_| connection_timeout())??;
+        KnownHostsStore::new(known_hosts_path).approve(&host, port, &identity, approval.action)?;
+        let connection = PooledConnection::new(handle, remote_forwards, upstream);
+        let acquired = if let Some(key) = pool_key {
+            pool.adopt(key, connection)?
+        } else {
+            pool.standalone(connection)
+        };
+        channel = Some(
+            acquired
+                .handle()
+                .channel_open_session()
+                .await
+                .map_err(map_russh_error)?,
+        );
+        lease = Some(acquired);
+    }
+    let lease = lease.ok_or_else(|| {
+        AppError::ssh(
+            "CONNECTION-POOL-UNAVAILABLE",
+            "无法取得 SSH 连接租约",
+            "connection lease was absent after acquisition",
+            true,
+        )
+    })?;
+    let channel = channel.ok_or_else(|| {
+        AppError::ssh(
+            "SSH-CHANNEL-FAILED",
+            "无法打开远程终端通道",
+            "session channel was absent after connection acquisition",
+            true,
+        )
+    })?;
     channel
         .request_pty(
             true,
@@ -305,15 +429,7 @@ async fn start_session_with_id(
     let task_app = app.clone();
     let task_session_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        run_session(
-            task_app,
-            task_session_id,
-            handle,
-            channel,
-            commands_rx,
-            remote_forwards,
-        )
-        .await;
+        run_session(task_app, task_session_id, channel, commands_rx, lease).await;
         let _ = completion_tx.send(());
     });
 
@@ -325,10 +441,69 @@ async fn start_session_with_id(
     })
 }
 
+#[cfg(test)]
 async fn connect_authenticated(
     request: &mut ConnectionRequest,
     expected_fingerprint: &str,
     authentication_context: Option<AuthenticationContext<'_>>,
+) -> Result<
+    (
+        client::Handle<VerifiedHandler>,
+        HostKeyIdentity,
+        RemoteForwardTable,
+    ),
+    AppError,
+> {
+    connect_authenticated_over_stream(request, expected_fingerprint, authentication_context, None)
+        .await
+}
+
+async fn connect_route_authenticated(
+    request: &mut ConnectionRequest,
+    expected_fingerprint: &str,
+    authentication_context: Option<AuthenticationContext<'_>>,
+) -> Result<
+    (
+        client::Handle<VerifiedHandler>,
+        HostKeyIdentity,
+        RemoteForwardTable,
+        Vec<client::Handle<VerifiedHandler>>,
+    ),
+    AppError,
+> {
+    let jumps = std::mem::take(&mut request.jump_hosts);
+    let mut upstream = connect_jump_chain(jumps, authentication_context).await?;
+    let stream = match upstream.last() {
+        Some(handle) => match stream_from_upstream(handle, request).await {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                disconnect_upstream(&mut upstream, "target route failed").await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    match connect_authenticated_over_stream(
+        request,
+        expected_fingerprint,
+        authentication_context,
+        stream,
+    )
+    .await
+    {
+        Ok((handle, identity, forwards)) => Ok((handle, identity, forwards, upstream)),
+        Err(error) => {
+            disconnect_upstream(&mut upstream, "target connection failed").await;
+            Err(error)
+        }
+    }
+}
+
+async fn connect_authenticated_over_stream(
+    request: &mut ConnectionRequest,
+    expected_fingerprint: &str,
+    authentication_context: Option<AuthenticationContext<'_>>,
+    stream: Option<network::BoxedNetworkStream>,
 ) -> Result<
     (
         client::Handle<VerifiedHandler>,
@@ -349,7 +524,11 @@ async fn connect_authenticated(
         .then(|| Duration::from_secs(request.keepalive_seconds));
     let config = Arc::new(client_config(keepalive));
     let connection = async {
-        if let Some(proxy) = request.proxy.as_ref() {
+        if let Some(stream) = stream {
+            client::connect_stream(config, stream, handler)
+                .await
+                .map_err(map_connect_error)
+        } else if let Some(proxy) = request.proxy.as_ref() {
             let stream = network::connect_target(
                 &request.host,
                 request.port,
@@ -471,11 +650,196 @@ async fn connect_authenticated(
     Ok((handle, identity, remote_forwards))
 }
 
-fn authentication_timeout(request: &ConnectionRequest) -> Duration {
-    match request.auth_type {
-        AuthType::KeyboardInteractive => INTERACTIVE_AUTH_TIMEOUT + Duration::from_secs(30),
-        _ => Duration::from_secs(request.timeout_seconds),
+async fn connect_jump_chain(
+    jumps: Vec<JumpHostRequest>,
+    authentication_context: Option<AuthenticationContext<'_>>,
+) -> Result<Vec<client::Handle<VerifiedHandler>>, AppError> {
+    let total = jumps.len();
+    let mut upstream = Vec::with_capacity(total);
+    for (index, mut jump) in jumps.into_iter().enumerate() {
+        if let Some(context) = authentication_context {
+            emit_route_progress(
+                context.app,
+                context.operation_id,
+                SessionStatus::Connecting,
+                &format!(
+                    "正在连接第 {}/{} 跳：{}",
+                    index + 1,
+                    total,
+                    jump.connection.name
+                ),
+            );
+        }
+        let stream = match upstream.last() {
+            Some(handle) => match stream_from_upstream(handle, &jump.connection).await {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    disconnect_upstream(&mut upstream, "jump route failed").await;
+                    return Err(map_jump_error(index, total, &jump.connection, error));
+                }
+            },
+            None => None,
+        };
+        match connect_authenticated_over_stream(
+            &mut jump.connection,
+            &jump.expected_fingerprint,
+            authentication_context,
+            stream,
+        )
+        .await
+        {
+            Ok((handle, _, _)) => upstream.push(handle),
+            Err(error) => {
+                disconnect_upstream(&mut upstream, "jump authentication failed").await;
+                return Err(map_jump_error(index, total, &jump.connection, error));
+            }
+        }
     }
+    Ok(upstream)
+}
+
+async fn stream_from_upstream(
+    upstream: &client::Handle<VerifiedHandler>,
+    request: &ConnectionRequest,
+) -> Result<network::BoxedNetworkStream, AppError> {
+    let (connect_host, connect_port) = request
+        .proxy
+        .as_ref()
+        .map(|proxy| (proxy.host.as_str(), proxy.port))
+        .unwrap_or((request.host.as_str(), request.port));
+    let channel = upstream
+        .channel_open_direct_tcpip(connect_host, u32::from(connect_port), "127.0.0.1", 0)
+        .await
+        .map_err(|error| {
+            AppError::ssh(
+                "JUMP-HOST-FAILED",
+                "跳板服务器无法连接下一节点",
+                error.to_string(),
+                true,
+            )
+        })?;
+    network::connect_over_stream(
+        Box::pin(channel.into_stream()),
+        &request.host,
+        request.port,
+        request.proxy.as_ref(),
+        Duration::from_secs(request.timeout_seconds),
+    )
+    .await
+}
+
+async fn inspect_host_key_over_route(
+    request: &ConnectionRequest,
+    upstream: Option<&client::Handle<VerifiedHandler>>,
+    known_hosts_path: &std::path::Path,
+) -> Result<HostKeyInspection, AppError> {
+    let upstream = match upstream {
+        Some(upstream) => upstream,
+        None => {
+            return inspect_host_key(
+                &request.host,
+                request.port,
+                Duration::from_secs(request.timeout_seconds),
+                known_hosts_path.to_path_buf(),
+                request.proxy.as_ref(),
+            )
+            .await
+        }
+    };
+    let captured_key = Arc::new(Mutex::new(None));
+    let stream = stream_from_upstream(upstream, request).await?;
+    let handle = tokio::time::timeout(
+        Duration::from_secs(request.timeout_seconds),
+        client::connect_stream(
+            Arc::new(client_config(None)),
+            stream,
+            ProbeHandler {
+                captured_key: Arc::clone(&captured_key),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| connection_timeout())?
+    .map_err(map_connect_error)?;
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "host key inspected", "")
+        .await;
+    let key = captured_key
+        .lock()
+        .map_err(|_| {
+            AppError::ssh(
+                "HOST-KEY-READ-FAILED",
+                "无法读取服务器指纹",
+                "host key capture lock was poisoned",
+                true,
+            )
+        })?
+        .clone()
+        .ok_or_else(|| {
+            AppError::ssh(
+                "HOST-KEY-MISSING",
+                "服务器未提供可验证的主机密钥",
+                "SSH handshake completed without a captured server key",
+                false,
+            )
+        })?;
+    let identity = HostKeyIdentity::from_public_key(&key).map_err(map_russh_error)?;
+    KnownHostsStore::new(known_hosts_path.to_path_buf()).inspect(
+        &request.host,
+        request.port,
+        &identity,
+    )
+}
+
+async fn disconnect_upstream(upstream: &mut Vec<client::Handle<VerifiedHandler>>, reason: &str) {
+    while let Some(handle) = upstream.pop() {
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, reason, "")
+            .await;
+    }
+}
+
+fn map_jump_error(
+    index: usize,
+    total: usize,
+    request: &ConnectionRequest,
+    error: AppError,
+) -> AppError {
+    AppError::ssh(
+        "JUMP-HOST-FAILED",
+        format!("第 {}/{} 跳“{}”连接失败", index + 1, total, request.name),
+        format!(
+            "jump {}/{} target={}:{} cause={} details={}",
+            index + 1,
+            total,
+            request.host,
+            request.port,
+            error.code,
+            error.technical_details.as_deref().unwrap_or("none")
+        ),
+        error.retryable,
+    )
+}
+
+fn emit_route_progress(app: &AppHandle, operation_id: &str, status: SessionStatus, message: &str) {
+    let _ = app.emit(
+        CONNECTION_PROGRESS_EVENT,
+        ConnectionProgressPayload {
+            operation_id: operation_id.to_owned(),
+            status,
+            message: message.to_owned(),
+        },
+    );
+}
+
+fn authentication_timeout(request: &ConnectionRequest) -> Duration {
+    std::iter::once(request)
+        .chain(request.jump_hosts.iter().map(|jump| &jump.connection))
+        .map(|connection| match connection.auth_type {
+            AuthType::KeyboardInteractive => INTERACTIVE_AUTH_TIMEOUT + Duration::from_secs(30),
+            _ => Duration::from_secs(connection.timeout_seconds),
+        })
+        .sum()
 }
 
 async fn authenticate_keyboard_interactive(
@@ -697,17 +1061,16 @@ fn agent_unavailable(details: String) -> AppError {
 async fn run_session(
     app: AppHandle,
     session_id: String,
-    handle: client::Handle<VerifiedHandler>,
     channel: russh::Channel<client::Msg>,
     mut commands: mpsc::Receiver<SessionCommand>,
-    remote_forwards: RemoteForwardTable,
+    lease: ConnectionLease,
 ) {
     app.state::<crate::diagnostics::DiagnosticLog>().record(
         "ssh-session-start",
         None,
         &format!("session={session_id}"),
     );
-    let handle = Arc::new(handle);
+    let handle = lease.handle();
     let (sftp_commands, sftp_receiver) = mpsc::channel(8);
     let sftp_worker =
         tauri::async_runtime::spawn(run_sftp_worker(Arc::clone(&handle), sftp_receiver));
@@ -775,8 +1138,7 @@ async fn run_session(
                             app.clone(),
                             session_id.clone(),
                             profile,
-                            Arc::clone(&handle),
-                            Arc::clone(&remote_forwards),
+                            lease.clone(),
                         )
                         .await;
                     let _ = response.send(result);
@@ -827,15 +1189,8 @@ async fn run_session(
         }
     })
     .await;
-    let tunnel_lease_active = app
-        .state::<crate::tunnel::TunnelRegistry>()
-        .has_active_session(&session_id)
-        .unwrap_or(false);
-    if !tunnel_lease_active {
-        let _ = handle
-            .disconnect(Disconnect::ByApplication, "session closed", "")
-            .await;
-    }
+    drop(handle);
+    drop(lease);
     let _ = app.state::<SessionRegistry>().remove_finished(&session_id);
     let _ = app.emit(
         SESSION_STATUS_EVENT,
@@ -1717,18 +2072,30 @@ mod tests {
         server::{self, Auth, Msg, Response, Server as _, Session},
         Channel, ChannelId,
     };
-    use tokio::sync::Mutex;
-
-    use super::{client_config, connect_authenticated, inspect_host_key, ProbeHandler};
-    use crate::{
-        known_hosts::KnownHostsStore,
-        models::{AuthType, ConnectionRequest, HostKeyStatus},
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::{oneshot, Mutex},
+        task::JoinSet,
     };
+
+    use super::{
+        client_config, connect_authenticated, connect_route_authenticated, inspect_host_key,
+        ProbeHandler,
+    };
+    use crate::{
+        connection_pool::{ConnectionPool, PooledConnection},
+        known_hosts::KnownHostsStore,
+        models::{AuthType, ConnectionRequest, HostKeyStatus, JumpHostRequest},
+    };
+
+    type RemoteForwardCancellations = Arc<Mutex<HashMap<(String, u32), oneshot::Sender<()>>>>;
 
     #[derive(Clone)]
     struct TestServer {
         channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
         startup_output: Arc<Vec<u8>>,
+        remote_forwards: RemoteForwardCancellations,
     }
 
     impl Default for TestServer {
@@ -1736,6 +2103,7 @@ mod tests {
             Self {
                 channels: Arc::default(),
                 startup_output: Arc::new(b"terminal-ready\r\n".to_vec()),
+                remote_forwards: Arc::default(),
             }
         }
     }
@@ -1805,6 +2173,100 @@ mod tests {
             Ok(())
         }
 
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _: &str,
+            _: u32,
+            reply: server::ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let port = match u16::try_from(port_to_connect) {
+                Ok(port) => port,
+                Err(_) => {
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+            };
+            match tokio::net::TcpStream::connect((host_to_connect, port)).await {
+                Ok(mut target) => {
+                    reply.accept().await;
+                    tokio::spawn(async move {
+                        let mut stream = channel.into_stream();
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+                    });
+                }
+                Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
+            }
+            Ok(())
+        }
+
+        async fn tcpip_forward(
+            &mut self,
+            address: &str,
+            port: &mut u32,
+            session: &mut Session,
+        ) -> Result<bool, Self::Error> {
+            let requested = u16::try_from(*port).map_err(|_| russh::Error::RequestDenied)?;
+            let listener = TcpListener::bind((address, requested))
+                .await
+                .map_err(russh::Error::IO)?;
+            *port = u32::from(listener.local_addr().map_err(russh::Error::IO)?.port());
+            let key = (address.to_owned(), *port);
+            let (cancel, mut cancellation) = oneshot::channel();
+            self.remote_forwards
+                .lock()
+                .await
+                .insert(key.clone(), cancel);
+            let handle = session.handle();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut cancellation => break,
+                        accepted = listener.accept() => {
+                            let Ok((mut stream, origin)) = accepted else { break };
+                            let handle = handle.clone();
+                            let connected_address = key.0.clone();
+                            let connected_port = key.1;
+                            tokio::spawn(async move {
+                                if let Ok(channel) = handle.channel_open_forwarded_tcpip(
+                                    connected_address,
+                                    connected_port,
+                                    origin.ip().to_string(),
+                                    u32::from(origin.port()),
+                                ).await {
+                                    let mut remote = channel.into_stream();
+                                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+            Ok(true)
+        }
+
+        async fn cancel_tcpip_forward(
+            &mut self,
+            address: &str,
+            port: u32,
+            _: &mut Session,
+        ) -> Result<bool, Self::Error> {
+            if let Some(cancel) = self
+                .remote_forwards
+                .lock()
+                .await
+                .remove(&(address.to_owned(), port))
+            {
+                let _ = cancel.send(());
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
         async fn pty_request(
             &mut self,
             channel: ChannelId,
@@ -1838,7 +2300,9 @@ mod tests {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            session.data(channel, data.to_vec())?;
+            if self.channels.lock().await.contains_key(&channel) {
+                session.data(channel, data.to_vec())?;
+            }
             Ok(())
         }
     }
@@ -1875,6 +2339,20 @@ mod tests {
         (address, fingerprint, task)
     }
 
+    async fn start_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = stream.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+        (address, task)
+    }
+
     fn request(address: std::net::SocketAddr, auth_type: AuthType) -> ConnectionRequest {
         ConnectionRequest {
             name: "integration".to_owned(),
@@ -1887,6 +2365,7 @@ mod tests {
             private_key_passphrase: None,
             agent_key_fingerprint: None,
             proxy: None,
+            jump_hosts: Vec::new(),
             columns: 100,
             rows: 30,
             timeout_seconds: 5,
@@ -1923,6 +2402,316 @@ mod tests {
             .await
             .unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_jump_route_opens_target_shell_over_direct_tcpip_channels() {
+        let (target_address, target_fingerprint, target_server) = start_server().await;
+        let (second_address, second_fingerprint, second_server) = start_server().await;
+        let (first_address, first_fingerprint, first_server) = start_server().await;
+        let mut target = request(target_address, AuthType::Password);
+        target.jump_hosts = vec![
+            JumpHostRequest {
+                connection: request(first_address, AuthType::Password),
+                expected_fingerprint: first_fingerprint,
+            },
+            JumpHostRequest {
+                connection: request(second_address, AuthType::Password),
+                expected_fingerprint: second_fingerprint,
+            },
+        ];
+
+        let (handle, _, _, mut upstream) =
+            connect_route_authenticated(&mut target, &target_fingerprint, None)
+                .await
+                .unwrap();
+        assert_eq!(upstream.len(), 2);
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(russh::ChannelMsg::Data { data }) = channel.wait().await {
+                    break data;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.as_ref(), b"terminal-ready\r\n");
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        super::disconnect_upstream(&mut upstream, "test complete").await;
+        first_server.abort();
+        second_server.abort();
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_second_jump_fingerprint_blocks_the_route() {
+        let (target_address, target_fingerprint, target_server) = start_server().await;
+        let (second_address, _, second_server) = start_server().await;
+        let (first_address, first_fingerprint, first_server) = start_server().await;
+        let mut target = request(target_address, AuthType::Password);
+        target.jump_hosts = vec![
+            JumpHostRequest {
+                connection: request(first_address, AuthType::Password),
+                expected_fingerprint: first_fingerprint,
+            },
+            JumpHostRequest {
+                connection: request(second_address, AuthType::Password),
+                expected_fingerprint: "SHA256:changed-second-hop".to_owned(),
+            },
+        ];
+
+        let error = match connect_route_authenticated(&mut target, &target_fingerprint, None).await
+        {
+            Ok(_) => panic!("route accepted a changed second-hop host key"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "JUMP-HOST-FAILED");
+        assert!(error.message.contains("2/2"));
+        first_server.abort();
+        second_server.abort();
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_pool_reuses_transport_until_the_last_lease_is_released() {
+        let (address, fingerprint, server) = start_server().await;
+        let mut connection = request(address, AuthType::Password);
+        let (handle, _, forwards) = connect_authenticated(&mut connection, &fingerprint, None)
+            .await
+            .unwrap();
+        let pool = ConnectionPool::default();
+        let first = pool
+            .adopt(
+                "saved-route".to_owned(),
+                PooledConnection::new(handle, forwards, Vec::new()),
+            )
+            .unwrap();
+        let second = pool.acquire("saved-route").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first.handle(), &second.handle()));
+        drop(first);
+
+        let channel = second.handle().channel_open_session().await.unwrap();
+        channel.close().await.unwrap();
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pool.acquire("saved-route").unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_and_dynamic_tunnels_forward_real_tcp_payloads() {
+        let (ssh_address, fingerprint, ssh_server) = start_server().await;
+        let (echo_address, echo_server) = start_echo_server().await;
+        let mut connection = request(ssh_address, AuthType::Password);
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
+            .await
+            .unwrap();
+        let handle = Arc::new(handle);
+
+        let ingress = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ingress_address = ingress.local_addr().unwrap();
+        let mut local_client = TcpStream::connect(ingress_address).await.unwrap();
+        let (local_server, _) = ingress.accept().await.unwrap();
+        let local_handle = Arc::clone(&handle);
+        let local = tokio::spawn(async move {
+            crate::tunnel::test_local_forward(
+                local_server,
+                local_handle,
+                echo_address.ip().to_string(),
+                echo_address.port(),
+            )
+            .await
+        });
+        local_client.write_all(b"local-forward").await.unwrap();
+        let mut local_echo = [0_u8; 13];
+        local_client.read_exact(&mut local_echo).await.unwrap();
+        assert_eq!(&local_echo, b"local-forward");
+        drop(local_client);
+        local.await.unwrap().unwrap();
+
+        let ingress = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ingress_address = ingress.local_addr().unwrap();
+        let mut socks_client = TcpStream::connect(ingress_address).await.unwrap();
+        let (socks_server, _) = ingress.accept().await.unwrap();
+        let dynamic_handle = Arc::clone(&handle);
+        let dynamic = tokio::spawn(async move {
+            crate::tunnel::test_dynamic_forward(socks_server, dynamic_handle).await
+        });
+        socks_client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        socks_client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let octets = match echo_address.ip() {
+            std::net::IpAddr::V4(address) => address.octets(),
+            std::net::IpAddr::V6(_) => panic!("echo listener was unexpectedly IPv6"),
+        };
+        let mut connect = vec![5, 1, 0, 1];
+        connect.extend_from_slice(&octets);
+        connect.extend_from_slice(&echo_address.port().to_be_bytes());
+        socks_client.write_all(&connect).await.unwrap();
+        let mut response = [0_u8; 10];
+        socks_client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response[..2], &[5, 0]);
+        socks_client.write_all(b"dynamic-forward").await.unwrap();
+        let mut dynamic_echo = [0_u8; 15];
+        socks_client.read_exact(&mut dynamic_echo).await.unwrap();
+        assert_eq!(&dynamic_echo, b"dynamic-forward");
+        drop(socks_client);
+        dynamic.await.unwrap().unwrap();
+
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        ssh_server.abort();
+        echo_server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_tunnel_forwards_to_local_target_and_can_be_cancelled() {
+        let (ssh_address, fingerprint, ssh_server) = start_server().await;
+        let (echo_address, echo_server) = start_echo_server().await;
+        let mut connection = request(ssh_address, AuthType::Password);
+        let (handle, _, forwards) = connect_authenticated(&mut connection, &fingerprint, None)
+            .await
+            .unwrap();
+        let handle = Arc::new(handle);
+        let bind_host = "127.0.0.1".to_owned();
+        let port = crate::tunnel::test_start_remote_forward(
+            Arc::clone(&handle),
+            Arc::clone(&forwards),
+            bind_host.clone(),
+            echo_address.ip().to_string(),
+            echo_address.port(),
+        )
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect((bind_host.as_str(), port))
+            .await
+            .unwrap();
+        client.write_all(b"remote-forward").await.unwrap();
+        let mut echoed = [0_u8; 14];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"remote-forward");
+        drop(client);
+
+        crate::tunnel::test_stop_remote_forward(
+            Arc::clone(&handle),
+            forwards,
+            bind_host.clone(),
+            port,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(TcpStream::connect((bind_host.as_str(), port))
+            .await
+            .is_err());
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        ssh_server.abort();
+        echo_server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_ssh_transport_handles_one_hundred_concurrent_local_forwards() {
+        let (ssh_address, fingerprint, ssh_server) = start_server().await;
+        let (echo_address, echo_server) = start_echo_server().await;
+        let mut connection = request(ssh_address, AuthType::Password);
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
+            .await
+            .unwrap();
+        let handle = Arc::new(handle);
+        let ingress = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ingress_address = ingress.local_addr().unwrap();
+        let accept_handle = Arc::clone(&handle);
+        let accept = tokio::spawn(async move {
+            let mut forwards = JoinSet::new();
+            for _ in 0..100 {
+                let (stream, _) = ingress.accept().await.unwrap();
+                let handle = Arc::clone(&accept_handle);
+                forwards.spawn(crate::tunnel::test_local_forward(
+                    stream,
+                    handle,
+                    echo_address.ip().to_string(),
+                    echo_address.port(),
+                ));
+            }
+            while let Some(result) = forwards.join_next().await {
+                result.unwrap().unwrap();
+            }
+        });
+        let mut clients = JoinSet::new();
+        for index in 0_u32..100 {
+            clients.spawn(async move {
+                let mut stream = TcpStream::connect(ingress_address).await.unwrap();
+                let payload = index.to_be_bytes();
+                stream.write_all(&payload).await.unwrap();
+                let mut echoed = [0_u8; 4];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(echoed, payload);
+            });
+        }
+        while let Some(result) = clients.join_next().await {
+            result.unwrap();
+        }
+        accept.await.unwrap();
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        ssh_server.abort();
+        echo_server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_forward_can_be_started_and_stopped_one_hundred_times() {
+        let (ssh_address, fingerprint, ssh_server) = start_server().await;
+        let (echo_address, echo_server) = start_echo_server().await;
+        let mut connection = request(ssh_address, AuthType::Password);
+        let (handle, _, _) = connect_authenticated(&mut connection, &fingerprint, None)
+            .await
+            .unwrap();
+        let handle = Arc::new(handle);
+
+        for index in 0_u32..100 {
+            let ingress = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let ingress_address = ingress.local_addr().unwrap();
+            let mut client = TcpStream::connect(ingress_address).await.unwrap();
+            let (server, _) = ingress.accept().await.unwrap();
+            let forward_handle = Arc::clone(&handle);
+            let forward = tokio::spawn(crate::tunnel::test_local_forward(
+                server,
+                forward_handle,
+                echo_address.ip().to_string(),
+                echo_address.port(),
+            ));
+            let payload = index.to_be_bytes();
+            client.write_all(&payload).await.unwrap();
+            let mut echoed = [0_u8; 4];
+            client.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(echoed, payload);
+            drop(client);
+            forward.await.unwrap().unwrap();
+        }
+
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        ssh_server.abort();
+        echo_server.abort();
     }
 
     #[tokio::test]

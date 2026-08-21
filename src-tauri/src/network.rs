@@ -55,6 +55,36 @@ pub async fn connect_target(
         })?
 }
 
+pub async fn connect_over_stream(
+    mut stream: BoxedNetworkStream,
+    host: &str,
+    port: u16,
+    proxy: Option<&ProxyRequest>,
+    timeout: Duration,
+) -> Result<BoxedNetworkStream, AppError> {
+    validate_target(host)?;
+    let Some(proxy) = proxy else {
+        return Ok(stream);
+    };
+    validate_proxy(proxy)?;
+    tokio::time::timeout(timeout, async {
+        match proxy.proxy_type {
+            ProxyType::Http => http_connect(&mut stream, host, port, proxy).await?,
+            ProxyType::Socks5 => socks5_connect(&mut stream, host, port, proxy).await?,
+        }
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| {
+        AppError::ssh(
+            "PROXY-CONNECT-FAILED",
+            "代理握手超时",
+            "proxy handshake over jump host timed out",
+            true,
+        )
+    })?
+}
+
 fn validate_target(host: &str) -> Result<(), AppError> {
     if host.trim().is_empty() || host.len() > 255 || host.contains(['\r', '\n', '\0']) {
         return Err(AppError::validation("目标主机地址无效"));
@@ -84,12 +114,15 @@ fn validate_proxy(proxy: &ProxyRequest) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn http_connect(
-    stream: &mut TcpStream,
+async fn http_connect<S>(
+    stream: &mut S,
     host: &str,
     port: u16,
     proxy: &ProxyRequest,
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let authority = format_authority(host, port);
     let mut request = format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
@@ -151,12 +184,15 @@ async fn http_connect(
     }
 }
 
-async fn socks5_connect(
-    stream: &mut TcpStream,
+async fn socks5_connect<S>(
+    stream: &mut S,
     host: &str,
     port: u16,
     proxy: &ProxyRequest,
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let authenticated = proxy.username.is_some();
     let methods: &[u8] = if authenticated {
         &[5, 2, 0, 2]
@@ -223,7 +259,10 @@ async fn socks5_connect(
     discard_socks_address(stream, response[3]).await
 }
 
-async fn socks5_authenticate(stream: &mut TcpStream, proxy: &ProxyRequest) -> Result<(), AppError> {
+async fn socks5_authenticate<S>(stream: &mut S, proxy: &ProxyRequest) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let username = proxy.username.as_deref().unwrap_or_default().as_bytes();
     let password = Zeroizing::new(proxy.password.clone().unwrap_or_default());
     let password_bytes = password.as_bytes();
@@ -273,7 +312,10 @@ fn encode_socks_address(buffer: &mut Vec<u8>, host: &str) -> Result<(), AppError
     Ok(())
 }
 
-async fn discard_socks_address(stream: &mut TcpStream, address_type: u8) -> Result<(), AppError> {
+async fn discard_socks_address<S>(stream: &mut S, address_type: u8) -> Result<(), AppError>
+where
+    S: AsyncRead + Unpin,
+{
     let length = match address_type {
         1 => 4,
         4 => 16,

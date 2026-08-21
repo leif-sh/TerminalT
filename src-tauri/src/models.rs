@@ -126,6 +126,8 @@ pub struct ConnectionRequest {
     pub agent_key_fingerprint: Option<String>,
     #[serde(default)]
     pub proxy: Option<ProxyRequest>,
+    #[serde(skip)]
+    pub jump_hosts: Vec<JumpHostRequest>,
     pub columns: u16,
     pub rows: u16,
     pub timeout_seconds: u64,
@@ -133,6 +135,12 @@ pub struct ConnectionRequest {
     pub keepalive_enabled: bool,
     #[serde(default = "default_keepalive_seconds")]
     pub keepalive_seconds: u64,
+}
+
+#[derive(Clone)]
+pub struct JumpHostRequest {
+    pub connection: ConnectionRequest,
+    pub expected_fingerprint: String,
 }
 
 impl ConnectionRequest {
@@ -541,6 +549,7 @@ mod tests {
             private_key_passphrase: None,
             agent_key_fingerprint: None,
             proxy: None,
+            jump_hosts: Vec::new(),
             columns: 80,
             rows: 24,
             timeout_seconds: 15,

@@ -437,18 +437,58 @@ impl AssetStore {
         self.write_document(&document)
     }
 
+    #[cfg(test)]
     pub fn connection_request(
         &self,
         id: &str,
         temporary_secret: Option<String>,
     ) -> Result<crate::models::ConnectionRequest, AppError> {
+        self.connection_route_requests(id, temporary_secret)?
+            .pop()
+            .ok_or_else(|| AppError::asset_not_found("connection", id))
+    }
+
+    pub fn connection_route_requests(
+        &self,
+        id: &str,
+        temporary_secret: Option<String>,
+    ) -> Result<Vec<crate::models::ConnectionRequest>, AppError> {
         let _guard = self.lock()?;
         let document = self.read_document()?;
-        let profile = document
+        let target = document
             .connections
             .iter()
             .find(|item| item.id == id)
             .ok_or_else(|| AppError::asset_not_found("connection", id))?;
+        let mut profile_ids = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut visiting = std::collections::HashSet::new();
+        collect_route_profiles(
+            &document.connections,
+            target,
+            &mut visited,
+            &mut visiting,
+            &mut profile_ids,
+        )?;
+        let mut route = Vec::with_capacity(profile_ids.len() + 1);
+        for profile_id in profile_ids {
+            let profile = document
+                .connections
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .ok_or_else(|| AppError::asset_not_found("jump-host", &profile_id))?;
+            route.push(self.request_from_profile(profile, None, true)?);
+        }
+        route.push(self.request_from_profile(target, temporary_secret, false)?);
+        Ok(route)
+    }
+
+    fn request_from_profile(
+        &self,
+        profile: &ConnectionProfile,
+        temporary_secret: Option<String>,
+        jump_host: bool,
+    ) -> Result<crate::models::ConnectionRequest, AppError> {
         let secret = match temporary_secret {
             Some(secret) => Some(Zeroizing::new(secret)),
             None => profile
@@ -468,12 +508,21 @@ impl AssetStore {
         if profile.auth_type == AuthType::Password && secret.is_none()
             || profile.credential_ref.is_some() && secret.is_none()
         {
-            return Err(AppError::credential(
-                "CREDENTIAL-MISSING",
-                "未找到已保存凭据，请重新输入",
-                "credential reference is absent or missing from Windows Credential Manager",
-                true,
-            ));
+            return Err(if jump_host {
+                AppError::ssh(
+                    "JUMP-HOST-FAILED",
+                    format!("跳板“{}”缺少已保存凭据", profile.name),
+                    format!("jump host {} has no available credential", profile.id),
+                    true,
+                )
+            } else {
+                AppError::credential(
+                    "CREDENTIAL-MISSING",
+                    "未找到已保存凭据，请重新输入",
+                    "credential reference is absent or missing from Windows Credential Manager",
+                    true,
+                )
+            });
         }
         Ok(crate::models::ConnectionRequest {
             name: profile.name.clone(),
@@ -507,6 +556,7 @@ impl AssetStore {
                     username: proxy.username.clone(),
                     password: proxy_password.as_ref().map(|value| value.to_string()),
                 }),
+            jump_hosts: Vec::new(),
             columns: 80,
             rows: 24,
             timeout_seconds: profile.timeout_seconds,
@@ -923,14 +973,13 @@ fn validate_tunnel(request: &SaveTunnelRequest) -> Result<(), AppError> {
     if bind_host.is_empty() || bind_host.len() > 255 || bind_host.contains(['\r', '\n', '\0']) {
         return Err(AppError::validation("隧道监听地址无效"));
     }
-    if matches!(request.kind, TunnelKind::Local | TunnelKind::Dynamic)
-        && !is_loopback_host(bind_host)
+    if (request.kind == TunnelKind::Remote || !is_loopback_host(bind_host))
         && !request.allow_non_loopback
     {
         return Err(AppError::ssh(
             "TUNNEL-RISK-CONFIRMATION-REQUIRED",
-            "非本机监听地址需要明确确认",
-            "local or dynamic tunnel requested a non-loopback bind without confirmation",
+            "远程转发或非本机监听地址需要明确确认",
+            "risky tunnel requested without explicit confirmation",
             false,
         ));
     }
@@ -992,6 +1041,35 @@ fn validate_jump_hosts(
             ));
         }
     }
+    Ok(())
+}
+
+fn collect_route_profiles(
+    connections: &[ConnectionProfile],
+    profile: &ConnectionProfile,
+    visited: &mut std::collections::HashSet<String>,
+    visiting: &mut std::collections::HashSet<String>,
+    route: &mut Vec<String>,
+) -> Result<(), AppError> {
+    if !visiting.insert(profile.id.clone()) {
+        return Err(AppError::ssh(
+            "JUMP-HOST-CYCLE",
+            "跳板链存在循环引用",
+            "persisted jump host graph contains a cycle",
+            false,
+        ));
+    }
+    for jump_id in &profile.jump_host_ids {
+        let jump = connections
+            .iter()
+            .find(|candidate| &candidate.id == jump_id)
+            .ok_or_else(|| AppError::asset_not_found("jump-host", jump_id))?;
+        collect_route_profiles(connections, jump, visited, visiting, route)?;
+        if visited.insert(jump.id.clone()) {
+            route.push(jump.id.clone());
+        }
+    }
+    visiting.remove(&profile.id);
     Ok(())
 }
 

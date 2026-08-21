@@ -1,5 +1,6 @@
 mod assets;
 mod authentication;
+mod connection_pool;
 mod credentials;
 mod diagnostics;
 mod error;
@@ -17,10 +18,10 @@ use models::{
     AgentIdentityInfo, AssetTransferSummary, AuthenticationPromptResponse, ConnectionAssetSnapshot,
     ConnectionGroup, ConnectionProfile, ConnectionProgressPayload, ConnectionRequest,
     ConnectionTestResult, GroupNameRequest, HealthResponse, HostKeyApproval, HostKeyInspection,
-    KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing, SaveConnectionRequest,
-    SaveTunnelRequest, SavedSessionRequest, SessionOutputPayload, SessionState, SessionStatus,
-    SessionStatusPayload, TransferDirection, TransferTask, TunnelProfile, TunnelRuntimeState,
-    WindowState,
+    JumpHostRequest, KeepaliveSettings, ReconnectSavedSessionRequest, RemoteDirectoryListing,
+    SaveConnectionRequest, SaveTunnelRequest, SavedSessionRequest, SessionOutputPayload,
+    SessionState, SessionStatus, SessionStatusPayload, TransferDirection, TransferTask,
+    TunnelProfile, TunnelRuntimeState, WindowState,
 };
 use session::{OperationRegistry, SessionCommand, SessionRegistry};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -487,6 +488,35 @@ async fn inspect_ssh_host_key(
 }
 
 #[tauri::command]
+async fn inspect_saved_ssh_host_key(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    store: State<'_, assets::AssetStore>,
+    operation_id: String,
+    connection_id: String,
+    temporary_secret: Option<String>,
+    keepalive: Option<KeepaliveSettings>,
+) -> Result<HostKeyInspection, AppError> {
+    let request =
+        prepare_saved_connection(&app, &store, &connection_id, temporary_secret, keepalive)?;
+    emit_progress(
+        &app,
+        &operation_id,
+        SessionStatus::HostKeyCheck,
+        "正在验证网络路径并获取目标指纹",
+    );
+    let cancellation = operations.register(operation_id.clone())?;
+    let result = tokio::select! {
+        result = ssh_client::inspect_route_host_key(
+            app.clone(), operation_id.clone(), request, known_hosts_path(&app)?,
+        ) => result,
+        _ = cancellation => Err(AppError::cancelled()),
+    };
+    operations.finish(&operation_id)?;
+    result
+}
+
+#[tauri::command]
 async fn test_ssh_connection(
     app: AppHandle,
     operations: State<'_, OperationRegistry>,
@@ -533,6 +563,17 @@ async fn connect_ssh(
     request: ConnectionRequest,
     approval: HostKeyApproval,
 ) -> Result<SessionState, AppError> {
+    connect_ssh_with_pool_key(app, operations, operation_id, request, approval, None).await
+}
+
+async fn connect_ssh_with_pool_key(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    pool_key: Option<String>,
+) -> Result<SessionState, AppError> {
     let setup_timeout = connection_setup_timeout(&request);
     emit_progress(
         &app,
@@ -551,13 +592,16 @@ async fn connect_ssh(
     let result = tokio::select! {
         result = time::timeout(
             setup_timeout,
-            ssh_client::start_session(
-                app.clone(),
-                operation_id.clone(),
-                request,
-                approval,
-                known_hosts_path,
-            ),
+            async {
+                match pool_key {
+                    Some(pool_key) => ssh_client::start_pooled_session(
+                        app.clone(), operation_id.clone(), request, approval, known_hosts_path, pool_key,
+                    ).await,
+                    None => ssh_client::start_session(
+                        app.clone(), operation_id.clone(), request, approval, known_hosts_path,
+                    ).await,
+                }
+            },
         ) => result.map_err(|_| AppError::ssh(
             "CONNECTION-TIMEOUT",
             "连接超时，请检查主机、端口和防火墙",
@@ -586,9 +630,13 @@ async fn test_saved_connection(
     operation_id: String,
     request: SavedSessionRequest,
 ) -> Result<ConnectionTestResult, AppError> {
-    let mut connection =
-        store.connection_request(&request.connection_id, request.temporary_secret)?;
-    apply_keepalive(&mut connection, request.keepalive);
+    let connection = prepare_saved_connection(
+        &app,
+        &store,
+        &request.connection_id,
+        request.temporary_secret,
+        request.keepalive,
+    )?;
     test_ssh_connection(app, operations, operation_id, connection, request.approval).await
 }
 
@@ -600,15 +648,25 @@ async fn connect_saved_connection(
     operation_id: String,
     request: SavedSessionRequest,
 ) -> Result<SessionState, AppError> {
-    let mut connection =
-        store.connection_request(&request.connection_id, request.temporary_secret)?;
-    apply_keepalive(&mut connection, request.keepalive);
-    let session = connect_ssh(
+    let connection = prepare_saved_connection(
+        &app,
+        &store,
+        &request.connection_id,
+        request.temporary_secret,
+        request.keepalive,
+    )?;
+    let pool_key = saved_pool_key(
+        &request.connection_id,
+        &connection,
+        &request.approval.fingerprint_sha256,
+    );
+    let session = connect_ssh_with_pool_key(
         app.clone(),
         operations,
         operation_id,
         connection,
         request.approval,
+        Some(pool_key),
     )
     .await?;
     for tunnel in store.automatic_tunnels(&request.connection_id)? {
@@ -639,6 +697,27 @@ async fn reconnect_ssh(
     request: ConnectionRequest,
     approval: HostKeyApproval,
 ) -> Result<SessionState, AppError> {
+    reconnect_ssh_with_pool_key(
+        app,
+        operations,
+        operation_id,
+        session_id,
+        request,
+        approval,
+        None,
+    )
+    .await
+}
+
+async fn reconnect_ssh_with_pool_key(
+    app: AppHandle,
+    operations: State<'_, OperationRegistry>,
+    operation_id: String,
+    session_id: String,
+    request: ConnectionRequest,
+    approval: HostKeyApproval,
+    pool_key: Option<String>,
+) -> Result<SessionState, AppError> {
     let setup_timeout = connection_setup_timeout(&request);
     emit_progress(
         &app,
@@ -651,14 +730,18 @@ async fn reconnect_ssh(
     let result = tokio::select! {
         result = time::timeout(
             setup_timeout,
-            ssh_client::reconnect_session(
-                app.clone(),
-                operation_id.clone(),
-                request,
-                approval,
-                known_hosts_path,
-                session_id,
-            ),
+            async {
+                match pool_key {
+                    Some(pool_key) => ssh_client::reconnect_pooled_session(
+                        app.clone(), operation_id.clone(), request, approval, known_hosts_path,
+                        session_id, pool_key,
+                    ).await,
+                    None => ssh_client::reconnect_session(
+                        app.clone(), operation_id.clone(), request, approval, known_hosts_path,
+                        session_id,
+                    ).await,
+                }
+            },
         ) => result.map_err(|_| AppError::ssh(
             "CONNECTION-TIMEOUT",
             "重新连接超时，请检查网络和服务器状态",
@@ -682,16 +765,26 @@ async fn reconnect_saved_connection(
     operation_id: String,
     request: ReconnectSavedSessionRequest,
 ) -> Result<SessionState, AppError> {
-    let mut connection =
-        store.connection_request(&request.connection_id, request.temporary_secret)?;
-    apply_keepalive(&mut connection, request.keepalive);
-    let session = reconnect_ssh(
+    let connection = prepare_saved_connection(
+        &app,
+        &store,
+        &request.connection_id,
+        request.temporary_secret,
+        request.keepalive,
+    )?;
+    let pool_key = saved_pool_key(
+        &request.connection_id,
+        &connection,
+        &request.approval.fingerprint_sha256,
+    );
+    let session = reconnect_ssh_with_pool_key(
         app,
         operations,
         operation_id,
         request.session_id,
         connection,
         request.approval,
+        Some(pool_key),
     )
     .await?;
     if let Err(error) = store.mark_connected(&request.connection_id) {
@@ -707,11 +800,94 @@ fn apply_keepalive(request: &mut ConnectionRequest, settings: Option<KeepaliveSe
     }
 }
 
-fn connection_setup_timeout(request: &ConnectionRequest) -> time::Duration {
-    match request.auth_type {
-        models::AuthType::KeyboardInteractive => time::Duration::from_secs(150),
-        _ => time::Duration::from_secs(request.timeout_seconds),
+fn prepare_saved_connection(
+    app: &AppHandle,
+    store: &assets::AssetStore,
+    connection_id: &str,
+    temporary_secret: Option<String>,
+    keepalive: Option<KeepaliveSettings>,
+) -> Result<ConnectionRequest, AppError> {
+    let mut route = store.connection_route_requests(connection_id, temporary_secret)?;
+    let mut target = route
+        .pop()
+        .ok_or_else(|| AppError::asset_not_found("connection", connection_id))?;
+    let trusted = known_hosts::KnownHostsStore::new(known_hosts_path(app)?)
+        .list()?
+        .into_iter()
+        .map(|record| ((record.host, record.port), record.fingerprint_sha256))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut jump_hosts = Vec::with_capacity(route.len());
+    for mut connection in route {
+        apply_keepalive(&mut connection, keepalive);
+        let expected_fingerprint = trusted
+            .get(&(connection.host.clone(), connection.port))
+            .cloned()
+            .ok_or_else(|| {
+                AppError::ssh(
+                    "JUMP-HOST-FAILED",
+                    format!("请先单独连接并信任跳板“{}”的服务器指纹", connection.name),
+                    format!(
+                        "jump host {}:{} has no trusted host key",
+                        connection.host, connection.port
+                    ),
+                    false,
+                )
+            })?;
+        jump_hosts.push(JumpHostRequest {
+            connection,
+            expected_fingerprint,
+        });
     }
+    apply_keepalive(&mut target, keepalive);
+    target.jump_hosts = jump_hosts;
+    Ok(target)
+}
+
+fn saved_pool_key(
+    connection_id: &str,
+    request: &ConnectionRequest,
+    target_fingerprint: &str,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut key = format!("saved:{connection_id}:target-key={target_fingerprint}");
+    for jump in &request.jump_hosts {
+        append_connection_pool_key(&mut key, &jump.connection);
+        let _ = write!(key, ":host-key={}", jump.expected_fingerprint);
+    }
+    append_connection_pool_key(&mut key, request);
+    key
+}
+
+fn append_connection_pool_key(key: &mut String, request: &ConnectionRequest) {
+    use std::fmt::Write as _;
+
+    let _ = write!(
+        key,
+        ":{}:{}:{}:{:?}:{:?}:{}:{}",
+        request.host,
+        request.port,
+        request.username,
+        request.auth_type,
+        request.proxy.as_ref().map(|proxy| (
+            proxy.proxy_type,
+            proxy.host.as_str(),
+            proxy.port,
+            proxy.username.as_deref()
+        )),
+        request.keepalive_enabled,
+        request.keepalive_seconds,
+    );
+}
+
+fn connection_setup_timeout(request: &ConnectionRequest) -> time::Duration {
+    std::iter::once(request)
+        .chain(request.jump_hosts.iter().map(|jump| &jump.connection))
+        .map(|connection| match connection.auth_type {
+            models::AuthType::KeyboardInteractive => time::Duration::from_secs(150),
+            _ => time::Duration::from_secs(connection.timeout_seconds),
+        })
+        .sum()
 }
 
 #[tauri::command]
@@ -770,6 +946,7 @@ fn emit_output(app: &AppHandle, session_id: &str, data: Vec<u8>) -> Result<(), A
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(SessionRegistry::default())
+        .manage(connection_pool::ConnectionPool::default())
         .manage(tunnel::TunnelRegistry::default())
         .manage(OperationRegistry::default())
         .manage(authentication::AuthenticationBroker::default())
@@ -863,6 +1040,7 @@ pub fn run() {
             start_transfer,
             cancel_transfer,
             inspect_ssh_host_key,
+            inspect_saved_ssh_host_key,
             test_ssh_connection,
             connect_ssh,
             test_saved_connection,
@@ -898,6 +1076,15 @@ pub fn run() {
             }
             if let Err(error) = app_handle.state::<OperationRegistry>().cancel_all() {
                 log::error!("{}: {}", error.code, error.message);
+            }
+            match tauri::async_runtime::block_on(
+                app_handle
+                    .state::<connection_pool::ConnectionPool>()
+                    .shutdown_all_bounded(time::Duration::from_secs(2)),
+            ) {
+                Ok(true) => {}
+                Ok(false) => log::warn!("connection pool shutdown exceeded the 2 second deadline"),
+                Err(error) => log::error!("{}: {}", error.code, error.message),
             }
         }
     });

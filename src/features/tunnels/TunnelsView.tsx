@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { ConnectionAssetSnapshot } from '../../domain/connection/types'
 import type { SessionState } from '../../domain/session/types'
 import type { SaveTunnelRequest, TunnelKind, TunnelProfile, TunnelRuntimeState } from '../../domain/tunnel/types'
-import { deleteTunnelProfile, listRuntimeTunnels, normalizeCommandError, onTunnelStatus, saveTunnelProfile, startTunnel, stopTunnel } from '../../lib/ipc'
+import { copyTunnelProfile, deleteTunnelProfile, listRuntimeTunnels, normalizeCommandError, onTunnelStatus, saveTunnelProfile, startTunnel, stopTunnel } from '../../lib/ipc'
 
 interface Props {
   assets?: ConnectionAssetSnapshot
@@ -28,10 +28,13 @@ export function TunnelsView({ assets, sessions, onAssetsChanged }: Props) {
 
   useEffect(() => {
     void listRuntimeTunnels().then(setRuntime).catch((cause) => setError(normalizeCommandError(cause).message))
+    const timer = window.setInterval(() => {
+      void listRuntimeTunnels().then(setRuntime).catch(() => undefined)
+    }, 1000)
     let dispose: (() => void) | undefined
     void onTunnelStatus(({ tunnel }) => setRuntime((items) => [...items.filter((item) => item.runtimeId !== tunnel.runtimeId), tunnel]))
       .then((unlisten) => { dispose = unlisten })
-    return () => dispose?.()
+    return () => { window.clearInterval(timer); dispose?.() }
   }, [])
 
   useEffect(() => {
@@ -48,9 +51,9 @@ export function TunnelsView({ assets, sessions, onAssetsChanged }: Props) {
     try {
       if (!draft.name.trim() || !draft.connectionId || !draft.bindHost.trim()) throw new Error('请完整填写名称、连接和监听地址')
       if (draft.kind !== 'dynamic' && (!draft.targetHost?.trim() || !draft.targetPort)) throw new Error('本地和远程转发必须填写目标地址与端口')
-      const nonLoopback = ['local', 'dynamic'].includes(draft.kind) && !['127.0.0.1', '::1', 'localhost'].includes(draft.bindHost.trim().toLowerCase())
-      const request = { ...draft, allowNonLoopback: nonLoopback ? window.confirm('该监听地址可能向局域网或公网暴露端口。确认继续保存？') : false }
-      if (nonLoopback && !request.allowNonLoopback) return
+      const risky = draft.kind === 'remote' || !['127.0.0.1', '::1', 'localhost'].includes(draft.bindHost.trim().toLowerCase())
+      const request = { ...draft, allowNonLoopback: risky ? window.confirm('该规则可能向远端、局域网或公网暴露端口。确认继续保存？') : false }
+      if (risky && !request.allowNonLoopback) return
       const saved = await saveTunnelProfile(request); await onAssetsChanged(); setSelectedId(saved.id); setEditing(false)
     } catch (cause) { setError(normalizeCommandError(cause).message) }
   }
@@ -63,6 +66,27 @@ export function TunnelsView({ assets, sessions, onAssetsChanged }: Props) {
     if (!active) return
     try { const state = await stopTunnel(active.runtimeId); setRuntime((items) => [...items.filter((item) => item.runtimeId !== active.runtimeId), state]); setError(undefined) }
     catch (cause) { setError(normalizeCommandError(cause).message) }
+  }
+  const remove = async () => {
+    if (!selected) return
+    const consequence = active ? '运行中的隧道将先停止，现有转发连接会中断。' : '该操作不会删除关联 SSH 连接。'
+    if (!window.confirm(`删除隧道“${selected.name}”？${consequence}`)) return
+    try {
+      if (active) await stopTunnel(active.runtimeId)
+      await deleteTunnelProfile(selected.id); setSelectedId(undefined); await onAssetsChanged(); setError(undefined)
+    } catch (cause) { setError(normalizeCommandError(cause).message) }
+  }
+
+  const copy = async () => {
+    if (!selected) return
+    try {
+      const copied = await copyTunnelProfile(selected.id)
+      await onAssetsChanged()
+      setSelectedId(copied.id)
+      setError(undefined)
+    } catch (cause) {
+      setError(normalizeCommandError(cause).message)
+    }
   }
 
   return <div className="tunnels-layout">
@@ -81,14 +105,15 @@ export function TunnelsView({ assets, sessions, onAssetsChanged }: Props) {
     <section className="tunnels-content">
       {error && <div className="settings-error">{error}</div>}
       {editing ? <TunnelEditor draft={draft} connections={assets?.connections ?? []} onChange={setDraft} onCancel={() => setEditing(false)} onSave={() => void save()} /> : selected ? <>
-        <header><span className="eyebrow">TUNNEL PROFILE</span><h2>{selected.name}</h2><p>{connectionName(selected.connectionId)} · {describeTunnel(selected)}</p></header>
+        <header><span className="eyebrow">TUNNEL PROFILE</span><h2>{selected.name}</h2><p>{connectionName(selected.connectionId)} · {describeTunnel(selected)}</p>{isRisky(selected) && <span className="tunnel-risk">高风险监听 · 请确认防火墙与 SSH GatewayPorts 策略</span>}</header>
         <div className="tunnel-runtime-card">
           <div><span>运行状态</span><strong>{active?.status ?? runtime.find((item) => item.profileId === selected.id)?.status ?? 'stopped'}</strong></div>
           <div><span>活动连接</span><strong>{active?.activeConnections ?? 0}</strong></div>
           <div><span>上行 / 下行</span><strong>{formatBytes(active?.bytesUp ?? 0)} / {formatBytes(active?.bytesDown ?? 0)}</strong></div>
         </div>
         <div className="tunnel-session-row"><label>复用 SSH 会话<select value={sessionId} onChange={(event) => setSessionId(event.target.value)}><option value="">请选择已连接会话</option>{connectedSessions.map((session) => <option key={session.id} value={session.id}>{session.title}</option>)}</select></label></div>
-        <div className="tunnel-actions"><button onClick={() => openEditor(selected)}>编辑规则</button>{active ? <button className="danger" onClick={() => void stop()}>停止隧道</button> : <button className="primary-button" disabled={!sessionId} onClick={() => void run()}>启动隧道</button>}<button className="danger" disabled={Boolean(active)} onClick={async () => { if (window.confirm(`删除隧道“${selected.name}”？`)) { await deleteTunnelProfile(selected.id); setSelectedId(undefined); await onAssetsChanged() } }}>删除</button></div>
+        {active?.lastError && <div className="tunnel-last-error"><strong>最近错误</strong><span>{active.lastError}</span></div>}
+        <div className="tunnel-actions"><button onClick={() => openEditor(selected)}>编辑规则</button><button onClick={() => void copy()}>复制规则</button>{active ? <button className="danger" onClick={() => void stop()}>停止隧道</button> : <button className="primary-button" disabled={!sessionId} onClick={() => void run()}>启动隧道</button>}<button className="danger" onClick={() => void remove()}>删除</button></div>
       </> : <div className="empty-workspace"><h2>选择一个隧道规则</h2><p>运行态端口、连接数和流量会在这里实时展示。</p></div>}
     </section>
   </div>
@@ -111,4 +136,9 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+}
+
+function isRisky(profile: TunnelProfile): boolean {
+  const host = profile.bindHost.trim().toLowerCase()
+  return profile.kind === 'remote' || !['127.0.0.1', '::1', 'localhost'].includes(host)
 }
